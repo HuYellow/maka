@@ -35,13 +35,12 @@ import {
  * Inside the Windows AppContainer realpath is unavailable — both node's JS
  * implementation (lstat of every ancestor up to the volume root) and the
  * native one (GetFinalPathNameByHandle) are denied by the LowBox token. The
- * Windows variant therefore resolves lexically and REJECTS requested reparse
- * points instead of following them. That is sound because request paths are
- * canonicalised by the client before launch, the broker rejects reparse-point
- * roots and applies recursive grants with link traversal disabled, and the ACL
- * grants themselves are the kernel-side enforcement: a nested link or a link
- * created after grant time points at an ungranted target the worker cannot
- * touch anyway.
+ * Windows variant therefore resolves lexically and REJECTS reparse points
+ * instead of following them. The broker rejects them for ordinary recursive
+ * roots. A read-only W1 Glob may opt into a partitioned root: directories on a
+ * reparse branch receive exact grants, clean siblings retain recursive grants,
+ * and the reparse entry and target receive no grant. The worker independently
+ * prunes those entries before Glob traversal; ACLs remain the kernel boundary.
  */
 export interface SandboxPathApi {
   realpath(path: string): Promise<string>;
