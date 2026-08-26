@@ -107,6 +107,20 @@ mod tests {
         icacls(&[path.to_str().expect("path")]).contains(sid)
     }
 
+    fn create_junction(path: &Path, target: &Path) {
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(path)
+            .arg(target)
+            .output()
+            .expect("run mklink");
+        assert!(
+            output.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn user_sid() -> String {
         crate::windows_launcher::current_user_sid_string().expect("current user SID")
     }
@@ -413,6 +427,98 @@ mod tests {
         .expect("exact root skips tree scan");
         assert_eq!(roots.len(), 1);
         assert!(!roots[0].read_recursive);
+    }
+
+    #[test]
+    fn recursive_read_grant_stops_at_nested_junction() {
+        let fixture = Fixture::new("nested-junction-read");
+        let junction_target = fixture
+            .target
+            .parent()
+            .expect("fixture base")
+            .join("junction-target");
+        fs::create_dir_all(&junction_target).expect("create junction target");
+        fs::write(junction_target.join("secret.txt"), "not granted").expect("seed target");
+        let junction = fixture.target.join("nested-junction");
+        create_junction(&junction, &junction_target);
+
+        let mut request = launch_request(
+            vec![fixture.target_str()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        request.request_id = format!("nested-junction-read-{}", std::process::id());
+
+        let mut observed_grants = None;
+        with_acl_grants(&request, APP_SID, || -> Result<(), LaunchFailure> {
+            observed_grants = Some([
+                sid_listed(&fixture.target, APP_SID),
+                sid_listed(&fixture.target.join("child").join("file.txt"), APP_SID),
+                sid_listed(&junction_target, APP_SID),
+                sid_listed(&junction_target.join("secret.txt"), APP_SID),
+            ]);
+            Ok(())
+        })
+        .expect("nested junction admits for recursive reads");
+
+        let [
+            root_granted,
+            ordinary_file_granted,
+            target_granted,
+            target_file_granted,
+        ] = observed_grants.expect("grant observations captured");
+        assert!(root_granted);
+        assert!(ordinary_file_granted);
+        assert!(
+            !target_granted,
+            "junction target must not receive the recursive read grant"
+        );
+        assert!(
+            !target_file_granted,
+            "junction descendants must remain ungranted"
+        );
+        assert!(!sid_listed(&fixture.target, APP_SID));
+        assert!(!sid_listed(&junction_target, APP_SID));
+    }
+
+    #[test]
+    fn recursive_write_grant_still_rejects_nested_junction() {
+        let fixture = Fixture::new("nested-junction-write");
+        let junction_target = fixture
+            .target
+            .parent()
+            .expect("fixture base")
+            .join("junction-target");
+        fs::create_dir_all(&junction_target).expect("create junction target");
+        create_junction(&fixture.target.join("nested-junction"), &junction_target);
+
+        let request = launch_request(
+            Vec::new(),
+            Vec::new(),
+            vec![fixture.target_str()],
+            Vec::new(),
+        );
+        let error = collect_roots(&request).expect_err("recursive write must fail closed");
+
+        assert!(error.contains("reparse point"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn reparse_point_root_still_fails_closed() {
+        let fixture = Fixture::new("junction-root");
+        let junction = fixture
+            .target
+            .parent()
+            .expect("fixture base")
+            .join("root-junction");
+        create_junction(&junction, &fixture.target);
+        let root = junction.to_string_lossy().into_owned();
+        let request = launch_request(vec![root], Vec::new(), Vec::new(), Vec::new());
+
+        let error = collect_roots(&request).expect_err("junction root must fail closed");
+
+        assert!(error.contains("reparse point"), "unexpected error: {error}");
     }
 
     fn shared_ledger_dir() -> PathBuf {

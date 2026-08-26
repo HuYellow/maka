@@ -35,12 +35,13 @@ import {
  * Inside the Windows AppContainer realpath is unavailable — both node's JS
  * implementation (lstat of every ancestor up to the volume root) and the
  * native one (GetFinalPathNameByHandle) are denied by the LowBox token. The
- * Windows variant therefore resolves lexically and REJECTS reparse points
- * outright instead of following them. That is sound because request paths are
- * canonicalised by the client before launch, the broker refuses to grant any
- * tree containing a reparse point, and the ACL grants themselves are the
- * kernel-side enforcement: a link created after grant time points at an
- * ungranted target the worker cannot touch anyway.
+ * Windows variant therefore resolves lexically and REJECTS requested reparse
+ * points instead of following them. That is sound because request paths are
+ * canonicalised by the client before launch, the broker rejects reparse-point
+ * roots and applies recursive grants with link traversal disabled, and the ACL
+ * grants themselves are the kernel-side enforcement: a nested link or a link
+ * created after grant time points at an ungranted target the worker cannot
+ * touch anyway.
  */
 export interface SandboxPathApi {
   realpath(path: string): Promise<string>;

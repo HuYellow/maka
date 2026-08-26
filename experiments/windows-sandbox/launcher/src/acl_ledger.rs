@@ -431,13 +431,19 @@ pub(crate) fn collect_roots(request: &LaunchRequest) -> Result<Vec<LedgerRoot>, 
         // Only a recursive grant extends into the tree, so only a recursive
         // grant requires the tree to be alias-free. Exact roots (e.g. the
         // cwd metadata anchor) may legitimately contain junctions deeper in
-        // the workspace that the sandbox never grants.
+        // the workspace that the sandbox never grants. A read-only recursive
+        // grant may also stop at nested reparse points: icacls `/L /T` updates
+        // the link object without following its target, leaving that target
+        // outside the AppContainer's authority. Recursive writes retain the
+        // stricter whole-tree rejection.
         let recursive_read = contains_path(&request.read_roots, path)
             && !contains_path(&request.exact_read_roots, path);
         let recursive_write = contains_path(&request.write_roots, path)
             && !contains_path(&request.exact_write_roots, path);
-        if metadata.is_dir() && (recursive_read || recursive_write) {
-            reject_aliased_entries(Path::new(path))?;
+        if metadata.is_dir() && recursive_write {
+            reject_aliased_entries(Path::new(path), false)?;
+        } else if metadata.is_dir() && recursive_read {
+            reject_aliased_entries(Path::new(path), true)?;
         }
         roots.push(LedgerRoot {
             path: path.clone(),
@@ -455,14 +461,21 @@ fn contains_path(paths: &[String], path: &str) -> bool {
     paths.iter().any(|entry| entry.eq_ignore_ascii_case(path))
 }
 
-/// Rejects reparse points and multi-link files anywhere in a recursively
-/// granted tree. An `(OI)(CI)` grant propagates inherited ACEs onto the
-/// existing children at grant time, so a file inside the tree that also has a
-/// hard link outside it would carry the grant past the declared root.
-fn reject_aliased_entries(path: &Path) -> Result<fs::Metadata, String> {
+/// Rejects multi-link files anywhere in a recursively granted tree. Nested
+/// reparse points may instead form a traversal boundary for read-only grants:
+/// `icacls /L /T` grants the link object but does not follow it to the target.
+/// An `(OI)(CI)` grant still propagates onto ordinary existing children, so a
+/// file inside the tree that also has a hard link outside it must fail closed.
+fn reject_aliased_entries(
+    path: &Path,
+    skip_nested_reparse_points: bool,
+) -> Result<fs::Metadata, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect ACL root {} failed: {error}", path.display()))?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        if skip_nested_reparse_points {
+            return Ok(metadata);
+        }
         return Err(format!(
             "ACL root contains a reparse point: {}",
             path.display()
@@ -473,7 +486,7 @@ fn reject_aliased_entries(path: &Path) -> Result<fs::Metadata, String> {
             .map_err(|error| format!("scan ACL root {} failed: {error}", path.display()))?
         {
             let entry = entry.map_err(|error| format!("scan ACL root failed: {error}"))?;
-            reject_aliased_entries(&entry.path())?;
+            reject_aliased_entries(&entry.path(), skip_nested_reparse_points)?;
         }
     } else {
         reject_multi_link_file(path)?;

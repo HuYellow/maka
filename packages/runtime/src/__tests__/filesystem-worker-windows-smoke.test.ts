@@ -19,7 +19,16 @@
 
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -186,6 +195,37 @@ describe('Windows filesystem worker smoke', { skip: !enabled }, () => {
       (error: unknown) =>
         error instanceof FilesystemWorkerClientError && error.reason === 'grep_unavailable',
     );
+  });
+
+  test('glob skips a nested junction without granting its target', async () => {
+    const sdkDirectory = join(workspace, 'sdk', 'javascript');
+    const storyDirectory = join(workspace, 'examples', 'terminal-story');
+    const junction = join(storyDirectory, 'node_modules', '@sunrioa', 'rin-sdk');
+    await mkdir(sdkDirectory, { recursive: true });
+    await mkdir(dirname(junction), { recursive: true });
+    await writeFile(join(sdkDirectory, 'package.json'), '{}\n');
+    await writeFile(join(storyDirectory, 'main.go'), 'package main\n');
+    await symlink(sdkDirectory, junction, 'junction');
+
+    const ordinary = await client.execute({
+      operation: { kind: 'glob', path: storyDirectory, pattern: 'main.go' },
+      cwd: workspace,
+      mode: 'ask',
+      expectedIdentity: 'unchecked',
+    });
+    assert.deepEqual(ordinary, { kind: 'glob', files: ['main.go'] });
+
+    const junctionDescendants = await client.execute({
+      operation: {
+        kind: 'glob',
+        path: storyDirectory,
+        pattern: 'node_modules/@sunrioa/rin-sdk/**/*',
+      },
+      cwd: workspace,
+      mode: 'ask',
+      expectedIdentity: 'unchecked',
+    });
+    assert.deepEqual(junctionDescendants, { kind: 'glob', files: [] });
   });
 
   test('fails closed for unapproved outside paths', async () => {
