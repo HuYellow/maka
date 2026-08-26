@@ -197,35 +197,35 @@ describe('Windows filesystem worker smoke', { skip: !enabled }, () => {
     );
   });
 
-  test('glob skips a nested junction without granting its target', async () => {
-    const sdkDirectory = join(workspace, 'sdk', 'javascript');
-    const storyDirectory = join(workspace, 'examples', 'terminal-story');
-    const junction = join(storyDirectory, 'node_modules', '@sunrioa', 'rin-sdk');
-    await mkdir(sdkDirectory, { recursive: true });
-    await mkdir(dirname(junction), { recursive: true });
-    await writeFile(join(sdkDirectory, 'package.json'), '{}\n');
-    await writeFile(join(storyDirectory, 'main.go'), 'package main\n');
-    await symlink(sdkDirectory, junction, 'junction');
+  test('runs Glob beside a nested junction without granting or traversing its target', async () => {
+    const project = join(workspace, 'junction-project');
+    const sourceDirectory = join(project, 'src');
+    const junctionParent = join(project, 'node_modules', '@sunrioa');
+    await mkdir(sourceDirectory, { recursive: true });
+    await mkdir(junctionParent, { recursive: true });
+    await writeFile(join(project, 'root.ts'), 'export const root = true;\n');
+    await writeFile(join(sourceDirectory, 'main.ts'), 'export const main = true;\n');
+    await writeFile(join(outside, 'secret.ts'), 'export const secret = true;\n');
+    await symlink(outside, join(junctionParent, 'rin-sdk'), 'junction');
 
-    const ordinary = await client.execute({
-      operation: { kind: 'glob', path: storyDirectory, pattern: 'main.go' },
+    const result = await client.execute({
+      operation: { kind: 'glob', path: project, pattern: '**/*.ts' },
       cwd: workspace,
       mode: 'ask',
       expectedIdentity: 'unchecked',
     });
-    assert.deepEqual(ordinary, { kind: 'glob', files: ['main.go'] });
 
-    const junctionDescendants = await client.execute({
-      operation: {
-        kind: 'glob',
-        path: storyDirectory,
-        pattern: 'node_modules/@sunrioa/rin-sdk/**/*',
-      },
-      cwd: workspace,
-      mode: 'ask',
-      expectedIdentity: 'unchecked',
-    });
-    assert.deepEqual(junctionDescendants, { kind: 'glob', files: [] });
+    assert.equal(result.kind, 'glob');
+    if (result.kind === 'glob') {
+      assert.deepEqual(result.files.map((file) => file.replaceAll('\\', '/')).sort(), [
+        'root.ts',
+        'src/main.ts',
+      ]);
+    }
+    assert.equal(
+      await readFile(join(outside, 'secret.ts'), 'utf8'),
+      'export const secret = true;\n',
+    );
   });
 
   test('fails closed for unapproved outside paths', async () => {
