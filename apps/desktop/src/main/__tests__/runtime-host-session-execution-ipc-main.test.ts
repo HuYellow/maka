@@ -38,14 +38,22 @@ import { createAttachmentApprovalRegistry } from "../attachment-approval.js";
 import type { DesktopRuntimeHostSession } from "../runtime-host-client.js";
 import {
   registerRuntimeHostSessionExecutionIpc,
+  registerRuntimeHostSessionObservationIpc,
   type RuntimeHostSessionExecutionIpcDeps,
 } from "../runtime-host-session-execution-ipc-main.js";
+import { RuntimeHostSessionObservationRegistry } from '../runtime-host-session-observation-registry.js';
 import { RuntimeHostSessionObserver } from "../runtime-host-session-observer.js";
 import { runtimeHostSessionFixture } from "./runtime-host-session-test-fixture.js";
 
 test('registers Session observation as one reconnectable operation', () => {
   const ipc = ipcHarness();
-  registerExecutionIpc({ client: executionClient({}) }, ipc);
+  registerRuntimeHostSessionObservationIpc(
+    {
+      observations: new RuntimeHostSessionObservationRegistry(),
+      resolveSideConversation: async () => false,
+    },
+    ipc,
+  );
 
   assert.equal(ipc.reconnectableChannels.has('sessions:observe'), true);
 });
@@ -111,6 +119,71 @@ test("keeps synthetic E2E interactions visible through Host hydration and retire
   );
   assert.deepEqual(configurationUpdates, [
     { sessionId: 'session-1', patch: { permissionMode: 'ask' } },
+  ]);
+  await observer.close();
+});
+
+test('answers a Client Capability approval through the existing Interaction authority', async () => {
+  const pending = {
+    schemaVersion: 1 as const,
+    interactionId: 'capability-1',
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    runId: 'run-1',
+    revision: 1 as const,
+    request: {
+      kind: 'client_capability' as const,
+      toolUseId: 'tool-1',
+      target: {
+        providerId: 'provider-1',
+        contractId: 'contract-1',
+        serverId: 'desktop_browser',
+        toolName: 'browser_snapshot',
+        capability: 'browser' as const,
+        scope: { kind: 'browser_origin' as const, origin: 'https://example.com' },
+      },
+    },
+    status: 'pending' as const,
+    outcome: null,
+  };
+  const observer = observerWithSnapshot({
+    interactions: { pending: [pending] },
+  });
+  const answers: unknown[] = [];
+  const ipc = ipcHarness();
+  registerExecutionIpc(
+    {
+      client: executionClient({
+        answerInteraction: async (input) => {
+          answers.push(input);
+          return {
+            ...pending,
+            revision: 2,
+            status: 'answered' as const,
+            outcome: {
+              kind: 'client_capability_decision' as const,
+              decision: 'allow' as const,
+              committedAt: 2,
+            },
+          };
+        },
+      }),
+      observer,
+    },
+    ipc,
+  );
+
+  await ipc.invoke('sessions:listActiveInteractions', 'session-1');
+  await ipc.invoke('sessions:respondToClientCapability', 'session-1', {
+    requestId: 'capability-1',
+    decision: 'allow',
+  });
+  assert.deepEqual(answers, [
+    {
+      sessionId: 'session-1',
+      interactionId: 'capability-1',
+      answer: { kind: 'client_capability', decision: 'allow' },
+    },
   ]);
   await observer.close();
 });
@@ -359,16 +432,11 @@ test("sends canonical content and uploads owned Attachment bytes through the Hos
       uploads.push(input);
       return attachment;
     },
-    startTurn: async (input) => {
+    submitMessage: async (input) => {
       starts.push(input);
       return {
-        kind: "started",
-        turn: {
-          sessionId: input.sessionId,
-          turnId: input.turnId,
-          runId: "run-1",
-          status: "running",
-        },
+        disposition: "turn_started",
+        turnId: "turn-1",
         skillInvocation: { loaded: [], failed: [], receipts: [] },
       };
     },
@@ -406,7 +474,8 @@ test("sends canonical content and uploads owned Attachment bytes through the Hos
   assert.deepEqual(starts, [
     {
       sessionId: "session-1",
-      turnId: "turn-1",
+      messageId: "turn-1",
+      placement: "current_turn",
       content: {
         text: "Read @notes.txt",
         attachments: [attachment],
@@ -472,16 +541,11 @@ test("uploads a selected workspace file as a Host-owned Session Artifact", async
           uploads.push(input);
           return attachment;
         },
-        startTurn: async (input) => {
+        submitMessage: async (input) => {
           starts.push(input);
           return {
-            kind: "started",
-            turn: {
-              sessionId: input.sessionId,
-              turnId: input.turnId,
-              runId: "run-1",
-              status: "running",
-            },
+            disposition: "turn_started",
+            turnId: "turn-1",
             skillInvocation: { loaded: [], failed: [], receipts: [] },
           };
         },
@@ -521,16 +585,11 @@ test("forwards explicit Skill invocation to the Host-owned Turn admission", asyn
     {
       client: executionClient({
         getSession: async () => session(),
-        startTurn: async (input) => {
+        submitMessage: async (input) => {
           starts.push(input);
           return {
-            kind: "started",
-            turn: {
-              sessionId: input.sessionId,
-              turnId: input.turnId,
-              runId: "run-1",
-              status: "running",
-            },
+            disposition: "turn_started",
+            turnId: "turn-skill",
             skillInvocation: {
               loaded: [{ id: "review", name: "Review" }],
               failed: [],
@@ -560,7 +619,8 @@ test("forwards explicit Skill invocation to the Host-owned Turn admission", asyn
   assert.deepEqual(starts, [
     {
       sessionId: "session-1",
-      turnId: "turn-skill",
+      messageId: "turn-skill",
+      placement: "current_turn",
       content: { text: "", displayText: "/skill:review", inlineReferences: [] },
       skillIds: ["review"],
     },
@@ -585,12 +645,13 @@ test("submits an ordinary composer message once under its stable message identit
     {
       client: executionClient({
         getSession: async () => session(),
-        startTurn: async () => {
-          throw new Error("ordinary composer send must not choose Turn admission");
-        },
         submitMessage: async (input) => {
           submits.push(input);
-          return { disposition: "turn_started", turnId: "host-turn" };
+          return {
+            disposition: "turn_started",
+            turnId: "host-turn",
+            skillInvocation: { loaded: [], failed: [], receipts: [] },
+          };
         },
       }),
       observer: unusedObserver(),
@@ -654,6 +715,45 @@ test('returns Host-owned cancellation proof to the renderer', async () => {
   );
 });
 
+test('returns Host-owned Message execution resolutions to the renderer', async () => {
+  const ipc = ipcHarness();
+  registerExecutionIpc(
+    {
+      client: executionClient({
+        queryMessageExecutions: async (input) => ({
+          resolutions: input.messageIds.map((messageId) => messageId === 'message-cancelled'
+            ? { messageId, state: 'cancelled' as const }
+            : {
+                messageId,
+                state: 'owned' as const,
+                turnId: 'successor-turn',
+                runId: 'successor-run',
+              }),
+        }),
+      }),
+    },
+    ipc,
+  );
+
+  assert.deepEqual(
+    await ipc.invoke('sessions:queryMessageExecutions', 'session-1', [
+      'message-delegated',
+      'message-cancelled',
+    ]),
+    {
+      resolutions: [
+        {
+          messageId: 'message-delegated',
+          state: 'owned',
+          turnId: 'successor-turn',
+          runId: 'successor-run',
+        },
+        { messageId: 'message-cancelled', state: 'cancelled' },
+      ],
+    },
+  );
+});
+
 test('submits a slash Skill message and reports the Host Skill outcome', async () => {
   const submits: unknown[] = [];
   const ipc = ipcHarness();
@@ -661,9 +761,6 @@ test('submits a slash Skill message and reports the Host Skill outcome', async (
     {
       client: executionClient({
         getSession: async () => session(),
-        startTurn: async () => {
-          throw new Error('a Skill Message must not route around Host admission');
-        },
         submitMessage: async (input) => {
           submits.push(input);
           return {
@@ -706,21 +803,19 @@ test('submits a slash Skill message and reports the Host Skill outcome', async (
 test("queues a mid-turn send as steering when the Host reports the session busy", async () => {
   const submits: unknown[] = [];
   const changes: unknown[] = [];
+  const skillInvocation = {
+    loaded: [{ id: 'review', name: 'Review' }],
+    failed: [{ request: 'typo', reason: 'not_found' as const }],
+    receipts: [],
+  };
   const ipc = ipcHarness();
   registerExecutionIpc(
     {
       client: executionClient({
         getSession: async () => session(),
-        startTurn: async () => {
-          throw new RuntimeHostOperationError(
-            "turn.start",
-            "session_busy",
-            "Session already has an active root Turn",
-          );
-        },
         submitMessage: async (input) => {
           submits.push(input);
-          return { disposition: "steering", queueRevision: 1 };
+          return { disposition: "steering", queueRevision: 1, skillInvocation };
         },
       }),
       observer: unusedObserver(),
@@ -755,81 +850,15 @@ test("queues a mid-turn send as steering when the Host reports the session busy"
     turnId: "turn-1",
     attachments: [],
     inlineReferences: [],
-    skillInvocation: { loaded: [], failed: [], receipts: [] },
+    skillInvocation,
   });
   assert.deepEqual(changes, [
     { reason: "status-change", sessionId: "session-1" },
   ]);
 });
 
-test("retries a dispatched normal send with its original Turn identity", async () => {
-  const starts: unknown[] = [];
-  let reconnectQueries = 0;
-  const ipc = ipcHarness();
-  registerExecutionIpc(
-    {
-      client: executionClient({
-        getSession: async () => {
-          reconnectQueries += 1;
-          return sideConversationSession();
-        },
-        startTurn: async (input) => {
-          starts.push(input);
-          if (starts.length === 1) {
-            throw new RuntimeHostRequestInterruptedError(
-              "turn.start",
-              "command",
-              "dispatched",
-              "connection_lost",
-            );
-          }
-          return {
-            kind: "started",
-            turn: {
-              sessionId: input.sessionId,
-              turnId: input.turnId,
-              runId: "run-1",
-              status: "running",
-            },
-            skillInvocation: { loaded: [], failed: [], receipts: [] },
-          };
-        },
-      }),
-      newId: () => "turn-1",
-    },
-    ipc,
-  );
-
-  const result = await ipc.invoke("sessions:send", "session-1", {
-    type: "send",
-    turnId: 'message-1',
-    text: "keep this Turn identity",
-  });
-
-  assert.equal(reconnectQueries, 2, 'initial Session lookup plus reconnect probe');
-  assert.deepEqual(starts, [
-    {
-      sessionId: "session-1",
-      turnId: "message-1",
-      content: { text: "keep this Turn identity", inlineReferences: [] },
-    },
-    {
-      sessionId: "session-1",
-      turnId: "message-1",
-      content: { text: "keep this Turn identity", inlineReferences: [] },
-    },
-  ]);
-  assert.deepEqual(result, {
-    ok: true,
-    turnId: "message-1",
-    attachments: [],
-    inlineReferences: [],
-    skillInvocation: { loaded: [], failed: [], receipts: [] },
-  });
-});
-
-test("does not add admission retry semantics to an ordinary send", async () => {
-  let starts = 0;
+test("resolves a twice-interrupted send as an unknown outcome", async () => {
+  let submits = 0;
   let sessionQueries = 0;
   const ipc = ipcHarness();
   registerExecutionIpc(
@@ -839,10 +868,10 @@ test("does not add admission retry semantics to an ordinary send", async () => {
           sessionQueries += 1;
           return session();
         },
-        startTurn: async () => {
-          starts += 1;
+        submitMessage: async () => {
+          submits += 1;
           throw new RuntimeHostRequestInterruptedError(
-            "turn.start",
+            "turn.message.submit",
             "command",
             "dispatched",
             "connection_lost",
@@ -854,18 +883,25 @@ test("does not add admission retry semantics to an ordinary send", async () => {
     ipc,
   );
 
-  await assert.rejects(
-    ipc.invoke("sessions:send", "session-1", {
+  // The Message identity is stable, so one retry is safe; a second lost answer
+  // is still an outcome the renderer must not resolve on its own.
+  assert.deepEqual(
+    await ipc.invoke("sessions:send", "session-1", {
       type: "send",
       text: "preserve the ordinary send contract",
     }),
-    RuntimeHostRequestInterruptedError,
+    {
+      ok: false,
+      reason: "outcome_unknown",
+      messageId: "turn-1",
+      skillInvocation: { loaded: [], failed: [], receipts: [] },
+    },
   );
-  assert.equal(starts, 1);
-  assert.equal(sessionQueries, 1, "only the initial Session lookup runs");
+  assert.equal(submits, 2);
+  assert.equal(sessionQueries, 2, "initial Session lookup plus reconnect probe");
 });
 
-test("retries a dispatched busy fallback with its original message identity", async () => {
+test("retries a dispatched send with its original message identity", async () => {
   const submits: unknown[] = [];
   let reconnectQueries = 0;
   const ipc = ipcHarness();
@@ -877,13 +913,6 @@ test("retries a dispatched busy fallback with its original message identity", as
           return sessionId === 'side-session'
             ? sideConversationSession(sessionId)
             : session();
-        },
-        startTurn: async () => {
-          throw new RuntimeHostOperationError(
-            "turn.start",
-            "session_busy",
-            "Session already has an active root Turn",
-          );
         },
         submitMessage: async (input) => {
           submits.push(input);
@@ -905,7 +934,11 @@ test("retries a dispatched busy fallback with its original message identity", as
               "connection_lost",
             );
           }
-          return { disposition: "steering", queueRevision: 1 };
+          return {
+            disposition: "steering",
+            queueRevision: 1,
+            skillInvocation: { loaded: [], failed: [], receipts: [] },
+          };
         },
       }),
       newId: () => "id-1",
@@ -971,7 +1004,7 @@ test("retries a dispatched busy fallback with its original message identity", as
   );
 });
 
-test("starts the turn from the queued message when the busy race resolves idle", async () => {
+test("answers a send with the Turn the Host started for it", async () => {
   const changes: unknown[] = [];
   const submits: unknown[] = [];
   const ipc = ipcHarness();
@@ -979,18 +1012,12 @@ test("starts the turn from the queued message when the busy race resolves idle",
     {
       client: executionClient({
         getSession: async () => session(),
-        startTurn: async () => {
-          throw new RuntimeHostOperationError(
-            "turn.start",
-            "session_busy",
-            "Session already has an active root Turn",
-          );
-        },
         submitMessage: async (input) => {
           submits.push(input);
           return {
             disposition: "turn_started",
             turnId: "turn-9",
+            skillInvocation: { loaded: [], failed: [], receipts: [] },
           };
         },
       }),
@@ -1030,47 +1057,29 @@ test("starts the turn from the queued message when the busy race resolves idle",
   ]);
 });
 
-test("keeps the busy failure for a Skill send instead of degrading it to steering", async () => {
+test("propagates a busy explicit Skill send instead of degrading it to steering", async () => {
   const submits: unknown[] = [];
   const ipc = ipcHarness();
   registerExecutionIpc(
     {
       client: executionClient({
         getSession: async () => session(),
-        startTurn: async () => {
+        submitMessage: async (input) => {
+          submits.push(input);
           throw new RuntimeHostOperationError(
-            "turn.start",
+            "turn.message.submit",
             "session_busy",
             "Session already has an active root Turn",
           );
         },
-        submitMessage: async (input) => {
-          submits.push(input);
-          return { disposition: "steering", queueRevision: 1 };
-        },
       }),
-      observer: unusedObserver(),
-      attachmentApprovals: createAttachmentApprovalRegistry(),
-      emitSessionsChanged() {},
-      stat: async () => ({ size: 0 }),
-      resizeImage: async (bytes) => bytes,
-      beforeStop() {},
       newId: () => "id-1",
     },
     ipc,
   );
 
-  // The Desktop composer carries Skills as canonical /skill: tokens in the
-  // text; explicit skillIds is the protocol-level variant.
-  await assert.rejects(
-    ipc.invoke("sessions:send", "session-1", {
-      type: "send",
-      turnId: "turn-1",
-      text: "/skill:review explain the tests",
-    }),
-    (error: unknown) =>
-      error instanceof RuntimeHostOperationError && error.code === "session_busy",
-  );
+  // Explicit skillIds are exact-Turn intent, so the Host refuses on a busy
+  // Session. The Desktop no longer carves that case out — it just reports it.
   await assert.rejects(
     ipc.invoke("sessions:send", "session-1", {
       type: "send",
@@ -1082,12 +1091,23 @@ test("keeps the busy failure for a Skill send instead of degrading it to steerin
     (error: unknown) =>
       error instanceof RuntimeHostOperationError && error.code === "session_busy",
   );
-  assert.deepEqual(submits, []);
+  assert.deepEqual(submits, [
+    {
+      sessionId: "session-1",
+      messageId: "turn-1",
+      placement: "current_turn",
+      content: {
+        text: "",
+        displayText: "/skill:review",
+        inlineReferences: [],
+      },
+      skillIds: ["review"],
+    },
+  ]);
 });
 
-test("queues explicit Desktop follow-ups", async () => {
+test("lets the Host queue a textual Skill token as steering", async () => {
   const submits: unknown[] = [];
-  let sequence = 0;
   const ipc = ipcHarness();
   registerExecutionIpc(
     {
@@ -1095,7 +1115,94 @@ test("queues explicit Desktop follow-ups", async () => {
         getSession: async () => session(),
         submitMessage: async (input) => {
           submits.push(input);
-          return { disposition: "followup", queueRevision: 4 };
+          return {
+            disposition: "steering",
+            queueRevision: 1,
+            skillInvocation: { loaded: [], failed: [], receipts: [] },
+          };
+        },
+      }),
+      newId: () => "id-1",
+    },
+    ipc,
+  );
+
+  // A `/skill:` token in the text is not exact-Turn intent: Host message
+  // preparation expands it on the queued path too. The Desktop stopped
+  // sniffing content for it, so this send is reported as the steering the
+  // Host made of it.
+  assert.deepEqual(
+    await ipc.invoke("sessions:send", "session-1", {
+      type: "send",
+      turnId: "turn-1",
+      text: "/skill:review explain the tests",
+    }),
+    {
+      ok: true,
+      steered: true,
+      turnId: "turn-1",
+      attachments: [],
+      inlineReferences: [],
+      skillInvocation: { loaded: [], failed: [], receipts: [] },
+    },
+  );
+  assert.equal(submits.length, 1);
+});
+
+test("reports a Host-blocked Skill send as a Skill failure", async () => {
+  const ipc = ipcHarness();
+  registerExecutionIpc(
+    {
+      client: executionClient({
+        getSession: async () => session(),
+        submitMessage: async () => ({
+          disposition: "blocked",
+          skillInvocation: {
+            loaded: [],
+            failed: [{ request: "missing", reason: "not_found" }],
+            receipts: [],
+          },
+        }),
+      }),
+      newId: () => "id-1",
+    },
+    ipc,
+  );
+
+  assert.deepEqual(
+    await ipc.invoke("sessions:send", "session-1", {
+      type: "send",
+      turnId: "turn-1",
+      text: "/skill:missing inspect this",
+    }),
+    {
+      ok: false,
+      reason: "skill_invocation_failed",
+      skillInvocation: {
+        loaded: [],
+        failed: [{ request: "missing", reason: "not_found" }],
+        receipts: [],
+      },
+    },
+  );
+});
+
+test("queues explicit Desktop follow-ups", async () => {
+  const submits: unknown[] = [];
+  let sequence = 0;
+  const skillInvocation = {
+    loaded: [{ id: 'writer', name: 'Writer' }],
+    failed: [{ request: 'missing', reason: 'not_found' as const }],
+    receipts: [],
+  };
+  const ipc = ipcHarness();
+  registerExecutionIpc(
+    {
+      client: executionClient({
+        getSession: async () => session(),
+        submitMessage: async (input) => {
+          submits.push(input);
+          return { disposition: "followup", queueRevision: 4, skillInvocation };
         },
       }),
       observer: unusedObserver(),
@@ -1145,7 +1252,7 @@ test("queues explicit Desktop follow-ups", async () => {
         },
       ],
       inlineReferences: [],
-      skillInvocation: { loaded: [], failed: [], receipts: [] },
+      skillInvocation,
     },
   );
   assert.deepEqual(submits, [
@@ -1314,7 +1421,11 @@ test("binds steer and stop to Host-owned queue and active Turn identities", asyn
           'Message disposition cannot be proven in this Host Epoch',
         );
       }
-      return { disposition: "steering", queueRevision: 2 };
+      return {
+        disposition: "steering",
+        queueRevision: 2,
+        skillInvocation: { loaded: [], failed: [], receipts: [] },
+      };
     },
     interruptTurn: async (input) => {
       stopLifecycle.push("interrupt");
@@ -1538,6 +1649,7 @@ function executionClient(overrides: Partial<ExecutionClient>): ExecutionClient {
     interruptTurn: unavailable,
     listSessionTurnLandmarks: unavailable,
     listSessionTurns: unavailable,
+    queryMessageExecutions: unavailable,
     queryMessages: unavailable,
     queryTurnResume: unavailable,
     readExecutionBoundary: unavailable,
@@ -1547,7 +1659,6 @@ function executionClient(overrides: Partial<ExecutionClient>): ExecutionClient {
     updateQueueEntry: unavailable,
     reorderQueueEntries: unavailable,
     setSessionReadMarker: unavailable,
-    startTurn: unavailable,
     startTurnResume: unavailable,
     submitMessage: unavailable,
     updateSessionConfiguration: unavailable,
@@ -1678,7 +1789,6 @@ function registerExecutionIpc(
       resizeImage: async (bytes) => bytes,
       beforeStop() {},
       ...deps,
-      observations: deps.observations ?? observer,
       sessionCopyCleanup: deps.sessionCopyCleanup ?? unusedSessionCopyCleanup(),
       onBackgroundError: deps.onBackgroundError ?? (() => undefined),
     },
@@ -1717,6 +1827,7 @@ function session(cwd = "/workspace", id = 'session-1'): SessionCatalogProjection
     hasUnread: false,
     status: "active",
     backend: "ai-sdk",
+    llmConnectionId: "connection-1",
     llmConnectionSlug: "test-connection",
     connectionLocked: true,
     model: "test-model",

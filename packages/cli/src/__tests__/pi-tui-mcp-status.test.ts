@@ -19,21 +19,25 @@
 
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { McpStatusOverlay } from '../pi-tui-mcp-status.js';
-import type { TuiMcpSnapshot, TuiMcpSurface } from '../tui-mcp-control.js';
+import type { TUI } from '@earendil-works/pi-tui';
+import { McpManagementOverlay } from '../pi-tui-mcp-status.js';
+import type { TuiMcpAction, TuiMcpManagement, TuiMcpSnapshot } from '../tui-mcp-control.js';
 import { stripAnsi } from '../tui-ansi.js';
 
-describe('MCP status overlay', () => {
+describe('MCP management overlay', () => {
   test('renders the local publication and negotiated server status', () => {
-    const overlay = new McpStatusOverlay({
+    const overlay = new McpManagementOverlay({
       locale: 'en',
       surface: surface({
         initialization: 'ready',
+        configuration: 'ready',
         publication: 'published',
         toolCount: 2,
         servers: [
           {
             serverId: 'filesystem',
+            configured: true,
+            synchronized: true,
             state: 'connected',
             transport: 'stdio',
             negotiatedProtocol: { era: 'modern', revision: '2026-07-28' },
@@ -52,7 +56,7 @@ describe('MCP status overlay', () => {
   });
 
   test('states the remote limitation instead of implying an empty local config', () => {
-    const overlay = new McpStatusOverlay({
+    const overlay = new McpManagementOverlay({
       locale: 'zh',
       viewportRows: () => 6,
       onClose: () => undefined,
@@ -65,15 +69,82 @@ describe('MCP status overlay', () => {
     assert.doesNotMatch(text, /尚未配置/u);
   });
 
+  test('masks remote provider credentials while typing and clears them after submission', async () => {
+    const actions: TuiMcpAction[] = [];
+    const mcp = surface({
+      initialization: 'ready',
+      configuration: 'ready',
+      publication: 'credential_rejected',
+      canManagePublicationCredential: true,
+      toolCount: 0,
+      servers: [],
+    });
+    mcp.execute = async (action) => {
+      actions.push(action);
+      return { status: 'applied', effect: 'published' };
+    };
+    const overlay = new McpManagementOverlay({
+      locale: 'en',
+      tui: {} as TUI,
+      surface: mcp,
+      viewportRows: () => 8,
+      onClose: () => undefined,
+      onChange: () => undefined,
+    });
+
+    let text = overlay.render(160).map(stripAnsi).join('\n');
+    assert.match(text, /provider credential rejected/u);
+    assert.match(text, /p Set provider credential/u);
+    overlay.handleInput('p');
+    overlay.handleInput('maka_rh_secret-marker');
+    text = overlay.render(160).map(stripAnsi).join('\n');
+    assert.match(text, /•••••••••••••••••••••/u);
+    assert.doesNotMatch(text, /maka_rh_secret-marker/u);
+
+    overlay.handleInput('\n');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(actions, [
+      { kind: 'set_publication_credential', credential: 'maka_rh_secret-marker' },
+    ]);
+    assert.doesNotMatch(overlay.render(160).map(stripAnsi).join('\n'), /maka_rh_secret-marker/u);
+  });
+
+  test('renders a competing remote provider as a visible conflict', () => {
+    const overlay = new McpManagementOverlay({
+      locale: 'en',
+      surface: surface({
+        initialization: 'ready',
+        configuration: 'ready',
+        publication: 'provider_conflict',
+        toolCount: 0,
+        servers: [],
+      }),
+      viewportRows: () => 6,
+      onClose: () => undefined,
+      onChange: () => undefined,
+    });
+
+    assert.match(overlay.render(100).map(stripAnsi).join('\n'), /provider active in another TUI/u);
+  });
+
   test('localizes manager states without changing their source values', () => {
-    const overlay = new McpStatusOverlay({
+    const overlay = new McpManagementOverlay({
       locale: 'zh',
       surface: surface({
         initialization: 'ready',
+        configuration: 'ready',
         publication: 'not_published',
         toolCount: 0,
         servers: [
-          { serverId: 'oauth', state: 'needs-auth', transport: 'streamable-http', toolCount: 0 },
+          {
+            serverId: 'oauth',
+            configured: true,
+            synchronized: true,
+            state: 'needs-auth',
+            transport: 'streamable-http',
+            toolCount: 0,
+          },
         ],
       }),
       viewportRows: () => 6,
@@ -92,6 +163,7 @@ describe('MCP status overlay', () => {
     let closed = 0;
     const mcp = surface({
       initialization: 'ready',
+      configuration: 'ready',
       publication: 'not_published',
       toolCount: 0,
       servers: [],
@@ -102,7 +174,7 @@ describe('MCP status overlay', () => {
         disposed += 1;
       };
     };
-    const overlay = new McpStatusOverlay({
+    const overlay = new McpManagementOverlay({
       locale: 'en',
       surface: mcp,
       viewportRows: () => 6,
@@ -117,13 +189,71 @@ describe('MCP status overlay', () => {
     assert.equal(disposed, 1);
     assert.equal(closed, 1);
   });
+
+  test('keeps long-list selection visible and applies actions to the visible server', async () => {
+    const actions: TuiMcpAction[] = [];
+    const mcp = surface({
+      initialization: 'ready',
+      configuration: 'ready',
+      publication: 'not_published',
+      toolCount: 0,
+      servers: Array.from({ length: 8 }, (_, index) => ({
+        serverId: `s${index}`,
+        configured: true,
+        synchronized: true,
+        enabled: true,
+        configuredTransport: 'stdio' as const,
+        configuredProtocol: 'legacy' as const,
+        ...(index === 5 ? { state: 'error' as const, error: 'visible diagnostic' } : {}),
+        toolCount: 0,
+      })),
+    });
+    mcp.execute = async (action) => {
+      actions.push(action);
+      return { status: 'applied', effect: 'published' };
+    };
+    const overlay = new McpManagementOverlay({
+      locale: 'en',
+      surface: mcp,
+      viewportRows: () => 6,
+      onClose: () => undefined,
+      onChange: () => undefined,
+    });
+    overlay.render(100);
+
+    for (let index = 0; index < 5; index += 1) overlay.handleInput('\u001b[B');
+    let text = overlay.render(100).map(stripAnsi).join('\n');
+    assert.match(text, /› ● s5/u);
+    assert.match(text, /visible diagnostic/u);
+
+    overlay.handleInput(' ');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(actions, [{ kind: 'set_enabled', serverId: 's5', enabled: false }]);
+
+    overlay.handleInput('\u001b[H');
+    text = overlay.render(100).map(stripAnsi).join('\n');
+    assert.match(text, /› ○ s0/u);
+    overlay.handleInput('\u001b[6~');
+    text = overlay.render(100).map(stripAnsi).join('\n');
+    assert.match(text, /› ○ s4/u);
+    overlay.handleInput('\u001b[F');
+    text = overlay.render(100).map(stripAnsi).join('\n');
+    assert.match(text, /› ○ s7/u);
+    overlay.handleInput('\u001b[5~');
+    text = overlay.render(100).map(stripAnsi).join('\n');
+    assert.match(text, /› ○ s4/u);
+  });
 });
 
 function surface(
   snapshot: TuiMcpSnapshot,
-): TuiMcpSurface & { subscribe(listener: () => void): () => void } {
+): TuiMcpManagement & { subscribe(listener: () => void): () => void } {
   return {
     snapshot: () => snapshot,
     subscribe: () => () => undefined,
+    configForEdit: () => undefined,
+    previewImport: () => ({ status: 'invalid', reason: 'invalid-config' }),
+    discardImportPreview: () => undefined,
+    execute: async () => ({ status: 'failed', reason: 'manager-failed' }),
   };
 }

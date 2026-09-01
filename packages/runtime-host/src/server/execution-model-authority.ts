@@ -20,6 +20,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   authorizeConnectionModel,
+  effectiveBaseUrl,
   PROVIDER_DEFAULTS,
   type RuntimeExecutionConnection,
 } from '@maka/core/llm-connections';
@@ -34,12 +35,13 @@ import {
   recordLlmCallStrict,
 } from '@maka/runtime/telemetry';
 import { buildProviderOptions, getAIModel } from '@maka/runtime/model-factory';
+import { stableHash } from '@maka/runtime/request-shape';
 import { buildSessionRecapMessages } from '@maka/runtime/session-recap';
 import {
   buildSessionTitlePrompt,
   cleanGeneratedSessionTitle,
   SESSION_TITLE_GENERATION_TIMEOUT_MS,
-} from '@maka/runtime/session-title';
+} from './session-title.js';
 import {
   createProxiedFetchTransport,
   type ProxiedFetchProxy,
@@ -401,7 +403,10 @@ type AuxiliaryModelRequest =
 interface HostAuxiliaryModelCallInput {
   readonly transportContextId: string;
   readonly telemetrySessionId?: string;
-  readonly header: Pick<SessionHeader, 'llmConnectionSlug' | 'model' | 'thinkingLevel'>;
+  readonly header: Pick<
+    SessionHeader,
+    'llmConnectionId' | 'llmConnectionSlug' | 'model' | 'thinkingLevel'
+  >;
   readonly callKind: Exclude<ModelCallKind, 'main'>;
   readonly callId: string;
   readonly abortSignal: AbortSignal;
@@ -726,7 +731,7 @@ class AuxiliaryModelCallConfigurationError extends Error {
   }
 }
 
-interface ResolvedExecutionTarget {
+export interface ResolvedExecutionTarget {
   readonly connection: RuntimeExecutionConnection;
   readonly model: string;
   readonly apiKey: string;
@@ -734,12 +739,48 @@ interface ResolvedExecutionTarget {
   readonly oauthBinding?: HostOAuthExecutionBinding;
   readonly networkProxy: RuntimePolicy['networkProxy'];
   readonly proxySecret?: string;
+  readonly providerStateIdentity: `sha256:${string}`;
+}
+
+type ExecutionRouteHeader = Pick<
+  BackendFactoryContext['header'],
+  'llmConnectionId' | 'llmConnectionSlug' | 'model'
+>;
+
+function executionConnectionRef(header: ExecutionRouteHeader) {
+  return header.llmConnectionId === undefined
+    ? { kind: 'catalog_slug' as const, connectionSlug: header.llmConnectionSlug }
+    : {
+        kind: 'bound' as const,
+        connectionId: header.llmConnectionId,
+        connectionSlug: header.llmConnectionSlug,
+      };
+}
+
+function providerStateIdentityForResolvedExecution(
+  resolved: Extract<
+    Awaited<ReturnType<RuntimePolicyStoresWriter['operations']['resolveExecutionConnection']>>,
+    { kind: 'ready' }
+  >,
+): `sha256:${string}` {
+  const credentialBasis = (material: typeof resolved.secretMaterial.connection) =>
+    material ? { credentialId: material.credentialId, revision: material.revision } : null;
+  return stableHash({
+    protocol: 'provider_state_identity_v1',
+    connectionId: resolved.connection.connectionId,
+    providerType: resolved.connection.providerType,
+    endpoint: new URL(effectiveBaseUrl(resolved.connection)).toString(),
+    credential: credentialBasis(resolved.secretMaterial.connection),
+    requestHeaders: credentialBasis(resolved.secretMaterial.requestHeaders),
+  });
 }
 
 async function resolveDailyReviewHeader(
   runtimePolicy: RuntimePolicyStoresWriter,
   modelKey: string,
-): Promise<Pick<SessionHeader, 'llmConnectionSlug' | 'model' | 'thinkingLevel'>> {
+): Promise<
+  Pick<SessionHeader, 'llmConnectionId' | 'llmConnectionSlug' | 'model' | 'thinkingLevel'>
+> {
   const explicit = parseDailyReviewModelKey(modelKey);
   if (modelKey.trim() && !explicit) {
     throw new AuxiliaryModelCallConfigurationError('Daily Review model key is invalid');
@@ -762,6 +803,7 @@ async function resolveDailyReviewHeader(
     );
   }
   return {
+    llmConnectionId: connection.connectionId,
     llmConnectionSlug: connection.slug,
     model: target.modelId,
     thinkingLevel: 'off',
@@ -781,7 +823,10 @@ function parseDailyReviewModelKey(
 }
 
 export async function resolveExecutionTarget(
-  header: Pick<BackendFactoryContext['header'], 'llmConnectionSlug' | 'model' | 'thinkingLevel'>,
+  header: Pick<
+    BackendFactoryContext['header'],
+    'llmConnectionId' | 'llmConnectionSlug' | 'model' | 'thinkingLevel'
+  >,
   runtimePolicy: {
     readonly operations: Pick<
       RuntimePolicyStoresWriter['operations'],
@@ -792,7 +837,7 @@ export async function resolveExecutionTarget(
   createFetchTransport: (proxy: ProxiedFetchProxy | null) => ProxiedFetchTransport,
 ): Promise<ResolvedExecutionTarget> {
   const resolved = await runtimePolicy.operations.resolveExecutionConnection(
-    header.llmConnectionSlug,
+    executionConnectionRef(header),
   );
   if (resolved.kind !== 'ready') {
     throw new AuxiliaryModelCallConfigurationError(
@@ -837,6 +882,7 @@ export async function resolveExecutionTarget(
   const requestHeaders = resolved.secretMaterial.requestHeaders
     ? parseRequestHeaders(resolved.secretMaterial.requestHeaders.secret)
     : {};
+  const providerStateIdentity = providerStateIdentityForResolvedExecution(resolved);
   if (provider.authKind === 'oauth_token') {
     const material = resolved.secretMaterial.connection;
     if (!material) {
@@ -855,11 +901,13 @@ export async function resolveExecutionTarget(
       requestHeaders,
       oauthBinding: oauthCredentials.bind({
         providerType: resolved.connection.providerType,
+        connectionId: resolved.connection.connectionId,
         connectionSlug: resolved.connection.slug,
         material,
         createRefreshTransport: () => createFetchTransport(refreshProxy),
       }),
       networkProxy: resolved.networkProxy,
+      providerStateIdentity,
       ...(resolved.secretMaterial.networkProxy
         ? { proxySecret: resolved.secretMaterial.networkProxy.secret }
         : {}),
@@ -872,6 +920,7 @@ export async function resolveExecutionTarget(
     apiKey: resolved.secretMaterial.connection?.secret ?? '',
     requestHeaders,
     networkProxy: resolved.networkProxy,
+    providerStateIdentity,
     ...(resolved.secretMaterial.networkProxy
       ? { proxySecret: resolved.secretMaterial.networkProxy.secret }
       : {}),

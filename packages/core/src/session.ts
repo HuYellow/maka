@@ -50,7 +50,7 @@ import { markPersisted, type PersistedValue } from './persisted-value.js';
 import type { SubagentWorkspaceBinding } from './subagent-workspace.js';
 import { decodeTurnOrigin, type TurnOrigin } from './turn-origin.js';
 
-export { DEEP_RESEARCH_SESSION_LABEL, isDeepResearchSession } from './explore-agent.js';
+export { DEEP_RESEARCH_SESSION_LABEL, isDeepResearchSession } from './deep-research.js';
 
 /** Runtime execution states. Archive visibility is represented by `isArchived`. */
 export const SESSION_STATUSES = [
@@ -273,6 +273,8 @@ export interface SessionHeader {
 
   // Backend / model config
   backend: PersistedBackendKind;
+  /** Immutable Connection entity identity. Optional only on legacy Session records. */
+  llmConnectionId?: string;
   llmConnectionSlug: string;
   /** True after first UserMessage is flushed. Storage self-heals (§5.2). */
   connectionLocked: boolean;
@@ -382,6 +384,8 @@ export interface SessionSummary {
   revisionIndex?: number;
   revisionState?: 'preparing' | 'committed';
   backend: PersistedBackendKind;
+  /** Immutable Connection entity identity. Optional only on legacy summaries. */
+  llmConnectionId?: string;
   llmConnectionSlug: string;
   /**
    * True once the session has user messages — its connection/model is
@@ -756,6 +760,7 @@ export type StoredMessage =
   | PermissionDecisionMessage
   | TokenUsageMessage
   | TurnStateMessage
+  | WorkHubCoordinationMessage
   | SystemNoteMessage;
 
 export interface UserMessage extends MessageContent {
@@ -773,6 +778,17 @@ export interface UserMessage extends MessageContent {
 /** Prefer the human-facing view of a user message when one was stored. */
 export function userFacingText(message: Pick<UserMessage, 'text' | 'displayText'>): string {
   return message.displayText ?? message.text;
+}
+
+const USER_VISIBLE_SESSION_SYSTEM_NOTES = new Set([
+  'context_compacted',
+  'context_compaction_failed_open',
+  'step_limit',
+]);
+
+/** Closed policy for system notes that are part of the user-visible transcript. */
+export function isUserVisibleSessionSystemNote(kind: string): boolean {
+  return USER_VISIBLE_SESSION_SYSTEM_NOTES.has(kind);
 }
 
 export interface AssistantMessage {
@@ -908,6 +924,107 @@ export interface TurnStateMessage {
   partialOutputRetained: boolean;
 }
 
+export const WORKHUB_COORDINATION_RECORD_SCHEMA_VERSION = 1 as const;
+export const WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION = 2 as const;
+
+export type WorkHubDelegationDisposition = 'delegate_existing' | 'create_new';
+
+export type WorkHubDelegationWorkspace =
+  | { readonly kind: 'project'; readonly projectId: string }
+  | { readonly kind: 'host_path'; readonly path: string };
+
+export interface WorkHubDelegationCreateSpec {
+  readonly title: string;
+  readonly workspace: WorkHubDelegationWorkspace;
+}
+
+interface WorkHubCoordinationMessageEnvelope {
+  type: 'workhub_coordination';
+  id: string;
+  /** The Coordination Turn that owns this action. */
+  turnId: string;
+  ts: number;
+  schemaVersion:
+    | typeof WORKHUB_COORDINATION_RECORD_SCHEMA_VERSION
+    | typeof WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION;
+  actionId: string;
+  actionFingerprint: `sha256:${string}`;
+  coordinationTurnId: string;
+  targetSessionId: string;
+  disposition: WorkHubDelegationDisposition;
+  /** Exact target payload; retained so retry does not depend on renderer memory. */
+  userText: string;
+  /** Present exactly for create_new. */
+  create?: WorkHubDelegationCreateSpec;
+}
+
+/**
+ * Atomic proof that one Coordination action and one target Message admission
+ * were committed together by the Runtime Host.
+ */
+export interface WorkHubDelegationAssignedMessage extends WorkHubCoordinationMessageEnvelope {
+  kind: 'delegation_assigned';
+  delegationId: string;
+  targetTurnId: string;
+  targetMessageId: string;
+  targetSessionName: string;
+  steered?: true;
+  /** Present only when this assignment atomically supersedes an earlier link. */
+  replacesActionId?: string;
+  replacesDelegationId?: string;
+}
+
+/** Durable recovery intent written before destructive target cancellation/Stop. */
+export interface WorkHubDelegationReplacementRequestedMessage
+  extends WorkHubCoordinationMessageEnvelope {
+  schemaVersion: typeof WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION;
+  kind: 'delegation_replacement_requested';
+  replacesActionId: string;
+  replacesDelegationId: string;
+  replacedTargetSessionId: string;
+  replacedTargetMessageId: string;
+  targetSessionName: string;
+}
+
+/** Atomic proof that the old link became superseded by the replacement assignment. */
+export interface WorkHubDelegationSupersededMessage {
+  type: 'workhub_coordination';
+  id: string;
+  turnId: string;
+  ts: number;
+  schemaVersion: typeof WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION;
+  kind: 'delegation_superseded';
+  actionId: string;
+  actionFingerprint: `sha256:${string}`;
+  coordinationTurnId: string;
+  supersededActionId: string;
+  supersededDelegationId: string;
+  replacementDelegationId: string;
+}
+
+/** Durable terminal proof that retirement succeeded but replacement admission did not. */
+export interface WorkHubDelegationReplacementAbortedMessage {
+  type: 'workhub_coordination';
+  id: string;
+  turnId: string;
+  ts: number;
+  schemaVersion: typeof WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION;
+  kind: 'delegation_replacement_aborted';
+  actionId: string;
+  actionFingerprint: `sha256:${string}`;
+  coordinationTurnId: string;
+  abortedActionId: string;
+  abortedDelegationId: string;
+  targetSessionId: string;
+  reason: 'target_unavailable' | 'target_waiting_for_user';
+}
+
+export type WorkHubCoordinationMessage =
+  | WorkHubDelegationAssignedMessage
+  | WorkHubDelegationReplacementRequestedMessage
+  | WorkHubDelegationReplacementAbortedMessage
+  | WorkHubDelegationSupersededMessage;
+
 export interface TurnRecord {
   turnId: string;
   firstSequence?: number;
@@ -955,7 +1072,15 @@ export interface SystemNoteMessage {
 
 const USER_MESSAGE_SHAPE = defineObjectShape<UserMessage>()(
   ['type', 'id', 'turnId', 'ts', 'text'],
-  ['displayText', 'attachments', 'quotes', 'inlineReferences', 'steeringEventId', 'origin'],
+  [
+    'displayText',
+    'attachments',
+    'directoryReferences',
+    'quotes',
+    'inlineReferences',
+    'steeringEventId',
+    'origin',
+  ],
 );
 const ASSISTANT_MESSAGE_SHAPE = defineObjectShape<AssistantMessage>()(
   ['type', 'id', 'turnId', 'ts', 'text', 'modelId'],
@@ -1030,6 +1155,98 @@ const TURN_STATE_MESSAGE_SHAPE = defineObjectShape<TurnStateMessage>()(
     'errorClass',
   ],
 );
+const WORKHUB_DELEGATION_ASSIGNED_MESSAGE_SHAPE =
+  defineObjectShape<WorkHubDelegationAssignedMessage>()(
+    [
+      'type',
+      'id',
+      'turnId',
+      'ts',
+      'schemaVersion',
+      'kind',
+      'actionId',
+      'actionFingerprint',
+      'coordinationTurnId',
+      'targetSessionId',
+      'disposition',
+      'userText',
+      'delegationId',
+      'targetTurnId',
+      'targetMessageId',
+      'targetSessionName',
+    ],
+    ['create', 'steered', 'replacesActionId', 'replacesDelegationId'],
+  );
+const WORKHUB_DELEGATION_REPLACEMENT_REQUESTED_MESSAGE_SHAPE =
+  defineObjectShape<WorkHubDelegationReplacementRequestedMessage>()(
+    [
+      'type',
+      'id',
+      'turnId',
+      'ts',
+      'schemaVersion',
+      'kind',
+      'actionId',
+      'actionFingerprint',
+      'coordinationTurnId',
+      'targetSessionId',
+      'disposition',
+      'userText',
+      'replacesActionId',
+      'replacesDelegationId',
+      'replacedTargetSessionId',
+      'replacedTargetMessageId',
+      'targetSessionName',
+    ],
+    ['create'],
+  );
+const WORKHUB_DELEGATION_SUPERSEDED_MESSAGE_SHAPE =
+  defineObjectShape<WorkHubDelegationSupersededMessage>()(
+    [
+      'type',
+      'id',
+      'turnId',
+      'ts',
+      'schemaVersion',
+      'kind',
+      'actionId',
+      'actionFingerprint',
+      'coordinationTurnId',
+      'supersededActionId',
+      'supersededDelegationId',
+      'replacementDelegationId',
+    ],
+    [],
+  );
+const WORKHUB_DELEGATION_REPLACEMENT_ABORTED_MESSAGE_SHAPE =
+  defineObjectShape<WorkHubDelegationReplacementAbortedMessage>()(
+    [
+      'type',
+      'id',
+      'turnId',
+      'ts',
+      'schemaVersion',
+      'kind',
+      'actionId',
+      'actionFingerprint',
+      'coordinationTurnId',
+      'abortedActionId',
+      'abortedDelegationId',
+      'targetSessionId',
+      'reason',
+    ],
+    [],
+  );
+const WORKHUB_DELEGATION_CREATE_SHAPE = defineObjectShape<WorkHubDelegationCreateSpec>()(
+  ['title', 'workspace'],
+  [],
+);
+const WORKHUB_DELEGATION_PROJECT_WORKSPACE_SHAPE = defineObjectShape<
+  Extract<WorkHubDelegationWorkspace, { kind: 'project' }>
+>()(['kind', 'projectId'], []);
+const WORKHUB_DELEGATION_HOST_PATH_WORKSPACE_SHAPE = defineObjectShape<
+  Extract<WorkHubDelegationWorkspace, { kind: 'host_path' }>
+>()(['kind', 'path'], []);
 const SYSTEM_NOTE_MESSAGE_SHAPE = defineObjectShape<SystemNoteMessage>()(
   ['type', 'id', 'ts', 'kind'],
   ['turnId', 'data'],
@@ -1077,7 +1294,15 @@ function decodeMessage(
         hasMessageEnvelope(message, true) &&
         (message.origin === undefined || decodeTurnOrigin(message.origin) !== undefined)
       ) {
-        const { displayText, attachments, quotes, inlineReferences, origin, ...envelope } = message;
+        const {
+          displayText,
+          attachments,
+          directoryReferences,
+          quotes,
+          inlineReferences,
+          origin,
+          ...envelope
+        } = message;
         const decodedOrigin = origin === undefined ? undefined : decodeTurnOrigin(origin);
         try {
           return {
@@ -1086,6 +1311,7 @@ function decodeMessage(
               text: message.text,
               displayText,
               attachments,
+              directoryReferences,
               quotes,
               inlineReferences,
             }),
@@ -1177,6 +1403,11 @@ function decodeMessage(
       )
         return message as unknown as TurnStateMessage;
       break;
+    case 'workhub_coordination':
+      if (isWorkHubCoordinationMessage(message)) {
+        return message as unknown as WorkHubCoordinationMessage;
+      }
+      break;
     case 'system_note':
       if (
         hasExactShape(message, SYSTEM_NOTE_MESSAGE_SHAPE) &&
@@ -1188,6 +1419,121 @@ function decodeMessage(
       break;
   }
   throw new Error('Invalid stored message schema');
+}
+
+function isWorkHubCoordinationMessage(message: Record<string, unknown>): boolean {
+  if (message.kind === 'delegation_replacement_aborted') {
+    return (
+      hasMessageEnvelope(message, true) &&
+      hasExactShape(message, WORKHUB_DELEGATION_REPLACEMENT_ABORTED_MESSAGE_SHAPE) &&
+      message.schemaVersion === WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION &&
+      typeof message.actionId === 'string' &&
+      typeof message.actionFingerprint === 'string' &&
+      /^sha256:[a-f0-9]{64}$/u.test(message.actionFingerprint) &&
+      typeof message.coordinationTurnId === 'string' &&
+      message.turnId === message.coordinationTurnId &&
+      typeof message.abortedActionId === 'string' &&
+      message.abortedActionId.length > 0 &&
+      typeof message.abortedDelegationId === 'string' &&
+      message.abortedDelegationId.length > 0 &&
+      typeof message.targetSessionId === 'string' &&
+      message.targetSessionId.length > 0 &&
+      (message.reason === 'target_unavailable' || message.reason === 'target_waiting_for_user')
+    );
+  }
+  if (message.kind === 'delegation_superseded') {
+    return (
+      hasMessageEnvelope(message, true) &&
+      hasExactShape(message, WORKHUB_DELEGATION_SUPERSEDED_MESSAGE_SHAPE) &&
+      message.schemaVersion === WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION &&
+      typeof message.actionId === 'string' &&
+      typeof message.actionFingerprint === 'string' &&
+      /^sha256:[a-f0-9]{64}$/u.test(message.actionFingerprint) &&
+      typeof message.coordinationTurnId === 'string' &&
+      message.turnId === message.coordinationTurnId &&
+      typeof message.supersededActionId === 'string' &&
+      message.supersededActionId.length > 0 &&
+      typeof message.supersededDelegationId === 'string' &&
+      message.supersededDelegationId.length > 0 &&
+      typeof message.replacementDelegationId === 'string' &&
+      message.replacementDelegationId.length > 0
+    );
+  }
+  const common =
+    hasMessageEnvelope(message, true) &&
+    (message.schemaVersion === WORKHUB_COORDINATION_RECORD_SCHEMA_VERSION ||
+      message.schemaVersion === WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION) &&
+    typeof message.actionId === 'string' &&
+    typeof message.actionFingerprint === 'string' &&
+    /^sha256:[a-f0-9]{64}$/u.test(message.actionFingerprint) &&
+    typeof message.coordinationTurnId === 'string' &&
+    message.turnId === message.coordinationTurnId &&
+    typeof message.targetSessionId === 'string' &&
+    typeof message.userText === 'string' &&
+    message.userText.trim().length > 0 &&
+    ((message.disposition === 'delegate_existing' && message.create === undefined) ||
+      (message.disposition === 'create_new' && isWorkHubDelegationCreateSpec(message.create))) &&
+    (message.disposition === 'delegate_existing' || message.disposition === 'create_new');
+  if (!common) return false;
+  if (message.kind === 'delegation_replacement_requested') {
+    return (
+      message.schemaVersion === WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION &&
+      hasExactShape(message, WORKHUB_DELEGATION_REPLACEMENT_REQUESTED_MESSAGE_SHAPE) &&
+      typeof message.replacesActionId === 'string' &&
+      message.replacesActionId.length > 0 &&
+      typeof message.replacesDelegationId === 'string' &&
+      message.replacesDelegationId.length > 0 &&
+      typeof message.replacedTargetSessionId === 'string' &&
+      message.replacedTargetSessionId.length > 0 &&
+      typeof message.replacedTargetMessageId === 'string' &&
+      message.replacedTargetMessageId.length > 0 &&
+      typeof message.targetSessionName === 'string' &&
+      message.targetSessionName.trim().length > 0
+    );
+  }
+  return (
+    message.kind === 'delegation_assigned' &&
+    hasExactShape(message, WORKHUB_DELEGATION_ASSIGNED_MESSAGE_SHAPE) &&
+    typeof message.delegationId === 'string' &&
+    typeof message.targetTurnId === 'string' &&
+    typeof message.targetMessageId === 'string' &&
+    typeof message.targetSessionName === 'string' &&
+    message.targetSessionName.trim().length > 0 &&
+    (message.steered === undefined || message.steered === true) &&
+    ((message.schemaVersion === WORKHUB_COORDINATION_RECORD_SCHEMA_VERSION &&
+      message.replacesActionId === undefined &&
+      message.replacesDelegationId === undefined) ||
+      (message.schemaVersion === WORKHUB_COORDINATION_REPLACEMENT_SCHEMA_VERSION &&
+        typeof message.replacesActionId === 'string' &&
+        message.replacesActionId.length > 0 &&
+        typeof message.replacesDelegationId === 'string' &&
+        message.replacesDelegationId.length > 0))
+  );
+}
+
+function isWorkHubDelegationCreateSpec(value: unknown): value is WorkHubDelegationCreateSpec {
+  if (
+    !isRecord(value) ||
+    !hasExactShape(value, WORKHUB_DELEGATION_CREATE_SHAPE) ||
+    typeof value.title !== 'string' ||
+    value.title.trim().length === 0 ||
+    !isRecord(value.workspace)
+  ) {
+    return false;
+  }
+  if (value.workspace.kind === 'project') {
+    return (
+      hasExactShape(value.workspace, WORKHUB_DELEGATION_PROJECT_WORKSPACE_SHAPE) &&
+      typeof value.workspace.projectId === 'string' &&
+      value.workspace.projectId.length > 0
+    );
+  }
+  return (
+    value.workspace.kind === 'host_path' &&
+    hasExactShape(value.workspace, WORKHUB_DELEGATION_HOST_PATH_WORKSPACE_SHAPE) &&
+    typeof value.workspace.path === 'string' &&
+    value.workspace.path.length > 0
+  );
 }
 
 function decodeStoredMessageContent(

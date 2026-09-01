@@ -49,7 +49,7 @@ import type {
   UsageRange,
   UsageStats,
 } from '@maka/core/settings';
-import type { LlmConnection, ProviderType } from '@maka/core/llm-connections';
+import type { IdentifiedLlmConnection, ProviderType } from '@maka/core/llm-connections';
 import type {
   DesktopRuntimeHostProfileChangedEvent,
   DesktopRuntimeHostProfileSnapshot,
@@ -154,7 +154,7 @@ export function SettingsSurface(props: {
   uiLocaleUpdateGate: UiLocaleUpdateGate;
   onUserLabelChange?(label: string): void;
   onDefaultPermissionModeChange(mode: ChatDefaultPermissionMode): void;
-  requestedSection?: SettingsSection;
+  request?: { readonly section?: SettingsSection; readonly profileId?: string };
   openProviderCatalog?: boolean;
   initialConnectionSlug?: string;
   initialCreateProviderType?: ProviderType;
@@ -172,7 +172,7 @@ export function SettingsSurface(props: {
   const copy = getSettingsSharedCopy(locale);
   const localizedNav = groupedNav(locale);
   const isNarrowSettings = useMediaQuery(NARROW_SETTINGS_QUERY);
-  const [section, setSection] = useState<SettingsSection>(() => props.requestedSection ?? readLastSettingsSection());
+  const [section, setSection] = useState<SettingsSection>(() => props.request?.section ?? readLastSettingsSection());
   const [providerCatalogRequested, setProviderCatalogRequested] = useState(props.openProviderCatalog === true);
   // One-shot landing intent, mirroring providerCatalogRequested above: the
   // request retires once ProvidersPanel consumes it, so remounting the panel
@@ -190,15 +190,15 @@ export function SettingsSurface(props: {
     setCreateProviderRequest(props.initialCreateProviderType);
   }, [props.initialCreateProviderType]);
 
-  // When the parent updates requestedSection (e.g. the palette opens
+  // When the parent updates the navigation request (e.g. the palette opens
   // Settings with a different section while it's already mounted), reflect
-  // that into the local state.
+  // its section into the local state.
   useEffect(() => {
-    if (props.requestedSection && props.requestedSection !== section) {
-      setSection(props.requestedSection);
+    if (props.request?.section && props.request.section !== section) {
+      setSection(props.request.section);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.requestedSection]);
+  }, [props.request?.section]);
 
   // Focus follows the active section's nav button: on mount, and whenever
   // `section` changes (nav click — a native-focus no-op — or a ⌘K palette
@@ -252,12 +252,14 @@ export function SettingsSurface(props: {
     () => snapshotCache.readRuntimeHostCatalog(),
     [snapshotCache],
   );
+  const initialSelectedProfileId =
+    props.request?.profileId ?? initialRuntimeHostCatalog?.defaultProfileId;
   const initialRuntimeHost = useMemo(
     () => readyRuntimeHost(
       initialRuntimeHostCatalog,
-      initialRuntimeHostCatalog?.defaultProfileId,
+      initialSelectedProfileId,
     ),
-    [initialRuntimeHostCatalog],
+    [initialRuntimeHostCatalog, initialSelectedProfileId],
   );
   const initialRuntimeHostKey = initialRuntimeHost
     ? runtimeHostSettingsKey(initialRuntimeHost)
@@ -288,13 +290,18 @@ export function SettingsSurface(props: {
     initialRuntimeHostCatalog,
   ));
   const [selectedProfileId, setSelectedProfileId] = useState<string | undefined>(
-    initialRuntimeHostCatalog?.defaultProfileId,
+    initialSelectedProfileId,
   );
   const selectedProfileIdRef = useRef(selectedProfileId);
   const defaultRuntimeHostProfileIdRef = useRef(
     initialRuntimeHostCatalog?.defaultProfileId,
   );
-  const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
+  const [usageStats, setUsageStats] = useState<{
+    hostKey: string;
+    epoch: string | undefined;
+    range: UsageRange;
+    value: UsageStats;
+  } | null>(null);
   const [clientLoading, setClientLoading] = useState(initialClientSettings === undefined);
   const settingsModalMountedRef = useMountedRef();
   const clientSettingsTicketRef = useRef(0);
@@ -304,7 +311,9 @@ export function SettingsSurface(props: {
   const usageReloadTicketRef = useRef(0);
   const runtimeHostReloadTicketRef = useRef(0);
   const runtimeHostCatalogHydratedRef = useRef(false);
-  const selectedProfileChangedByUserRef = useRef(false);
+  const selectedProfileChangedByUserRef = useRef(
+    props.request?.profileId !== undefined,
+  );
   const runtimeHostLifecycleByProfileRef = useRef(
     new Map<string, DesktopRuntimeHostProfileChangedEvent>(),
   );
@@ -344,6 +353,16 @@ export function SettingsSurface(props: {
   const selectedRuntimeHostKey = selectedRuntimeHost
     ? runtimeHostSettingsKey(selectedRuntimeHost)
     : undefined;
+  const selectedRuntimeHostKeyRef = useRef(selectedRuntimeHostKey);
+  selectedRuntimeHostKeyRef.current = selectedRuntimeHostKey;
+  // A same-key Host can be replaced in place (hostId stable, epoch bumped) on
+  // reconnect. `runtimeHostSettingsKey` is epoch-free, so usage must key on the
+  // epoch too — otherwise a reconnect clears the page but never refetches.
+  const selectedRuntimeHostEpoch = selectedProfileId
+    ? runtimeHostLifecycleByProfile.get(selectedProfileId)?.epoch
+    : undefined;
+  const selectedRuntimeHostEpochRef = useRef(selectedRuntimeHostEpoch);
+  selectedRuntimeHostEpochRef.current = selectedRuntimeHostEpoch;
   function commitSelectedRuntimeHostProfile(
     profileId: string,
     snapshot = runtimeHosts,
@@ -353,10 +372,14 @@ export function SettingsSurface(props: {
     const nextKey = nextHost ? runtimeHostSettingsKey(nextHost) : undefined;
     // Reject old-Host reads and writes synchronously with the authority
     // change, before React renders the newly selected profile.
-    runtimeHostRequestAuthority.selectTarget(
+    const targetChanged = runtimeHostRequestAuthority.selectTarget(
       nextKey,
       lifecycle?.epoch,
     );
+    if (targetChanged) {
+      usageReloadTicketRef.current += 1;
+      setUsageStats(null);
+    }
     selectedProfileIdRef.current = profileId;
     setSelectedProfileId(profileId);
   }
@@ -603,15 +626,33 @@ export function SettingsSurface(props: {
   }
 
   async function reloadUsage(range: UsageRange = settings.usage.range) {
+    const host = selectedRuntimeHost;
+    if (!host) {
+      usageReloadTicketRef.current += 1;
+      setUsageStats(null);
+      return;
+    }
+    const hostKey = runtimeHostSettingsKey(host);
+    const epoch = selectedRuntimeHostEpochRef.current;
     const ticket = usageReloadTicketRef.current + 1;
     usageReloadTicketRef.current = ticket;
     try {
-      const next = await window.maka.settings.usageStats(range);
-      if (settingsModalMountedRef.current && ticket === usageReloadTicketRef.current) {
-        setUsageStats(next);
+      const next = await window.maka.settings.usageStats(range, host);
+      if (
+        settingsModalMountedRef.current &&
+        ticket === usageReloadTicketRef.current &&
+        selectedRuntimeHostKeyRef.current === hostKey &&
+        selectedRuntimeHostEpochRef.current === epoch
+      ) {
+        setUsageStats({ hostKey, epoch, range, value: next });
       }
     } catch (error) {
-      if (settingsModalMountedRef.current && ticket === usageReloadTicketRef.current) {
+      if (
+        settingsModalMountedRef.current &&
+        ticket === usageReloadTicketRef.current &&
+        selectedRuntimeHostKeyRef.current === hostKey &&
+        selectedRuntimeHostEpochRef.current === epoch
+      ) {
         toast.error(copy.usageLoadFailed, settingsActionErrorMessage(error, locale));
       }
     }
@@ -682,6 +723,8 @@ export function SettingsSurface(props: {
           // Fence synchronously, before the catalog refresh can resolve. The
           // previous generation's snapshots stay visible but no Host-backed
           // control may treat them as current write authority.
+          usageReloadTicketRef.current += 1;
+          setUsageStats(null);
           setRuntimeHostCatalog(invalidateSettingsResourceGeneration);
           setRuntimeHostSettings(invalidateSettingsResourceGeneration);
           setRuntimeHostConnections(invalidateSettingsResourceGeneration);
@@ -747,18 +790,12 @@ export function SettingsSurface(props: {
   }, [connectionsBridge, selectedRuntimeHost]);
 
   useEffect(() => {
-    // Keyed on the EFFECTIVE range, not just the section: usage is
-    // client-owned (settings-ownership.ts), and the persisted range rides
-    // in with the async getClient() load — which lands after this effect
-    // first fires when a Settings window is restored directly onto
-    // 使用统计. The initial fetch then used the '24h' default while the
-    // chip showed the persisted range, and nothing refetched — every
-    // metric read 0 until a manual refresh or a tab round-trip. With the
-    // range in the deps, the truth's arrival (or any later range change,
-    // including the page's own persisted range clicks) is the trigger, and
-    // this effect is the single owner of range-driven fetches.
+    // Usage records are Host-owned while the display preferences remain
+    // client-owned. Refetch when the persisted range arrives, the selected Host
+    // changes, or the selected Host is replaced in place (epoch bump) so labels
+    // and numbers always describe one live Host generation.
     if (section === 'usage') void reloadUsage(settings.usage.range);
-  }, [section, settings.usage.range]);
+  }, [section, settings.usage.range, selectedRuntimeHostKey, selectedRuntimeHostEpoch]);
 
   // PR-SETTINGS-HEADER-COPY-MAP-0 (U1): the page header derives its title
   // and description from the section→copy map keyed by the active section,
@@ -964,7 +1001,14 @@ export function SettingsSurface(props: {
                           <SettingsPageBody
                             section={section}
                             settings={settings}
-                            usageStats={usageStats}
+                            usageStats={
+                              usageStats &&
+                              usageStats.hostKey === selectedRuntimeHostKey &&
+                              usageStats.epoch === selectedRuntimeHostEpoch &&
+                              usageStats.range === settings.usage.range
+                                ? usageStats.value
+                                : null
+                            }
                             connections={connections}
                             connectionsBridge={connectionsBridge}
                             defaultSlug={defaultSlug}
@@ -1020,7 +1064,7 @@ function SettingsPageBody(props: {
   section: SettingsSection;
   settings: AppSettings;
   usageStats: UsageStats | null;
-  connections: LlmConnection[];
+  connections: IdentifiedLlmConnection[];
   connectionsBridge: RuntimeHostSettingsConnectionsBridge | undefined;
   defaultSlug: string | null;
   runtimeHost: DesktopRuntimeHostRef | undefined;

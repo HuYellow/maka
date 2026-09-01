@@ -28,6 +28,16 @@
 - Added `/transcript` to browse long TUI sessions without depending on terminal
   scrollback, with line, page, and first/last navigation.
 
+### Fixed
+
+- Fixed a renderer crash dialog reporting React error #185 ("Maximum update depth
+  exceeded") coming from the composer's prompt-history inline completion (#4117): the
+  offer engine the 0.1.11 composer fed could flip-flop its announcement state on
+  real-layout measurements until React hit its nested-update limit, which surfaced as
+  the crash dialog. The unstable completion wiring was removed from the composer
+  (#3292), Astryx 0.5.0 no longer ships the engine (#3755), and regression tests now
+  keep that seam closed.
+
 ### Changed
 
 - Made typed `request()` the sole direct Runtime Host operation API; removed the 17 forwarding
@@ -37,6 +47,7 @@
   terminal coalescing, stop/drain, and durable continuation admission now have one production
   owner, immutable request snapshots remain enforced at AgentRun acceptance and backend dispatch,
   and SessionEvent-to-RuntimeEvent conversion remains a pure mapper.
+- Retired the Task Ledger domain: SessionTodo is now the sole authority for in-session work items, and the operational-state schema drops the `workflow_task_ledger_events` table on first open. **Unfinished Tasks are not migrated and are permanently deleted.** This affects workspaces last opened by `v0.1.0` through `v0.1.11`, `cli-v0.1.0-beta.1`, `v0.2.0-incubating-rc1`, or a `v0.2.0-dev` build; those releases wrote Tasks to a table that no shipped build ever bridged into SessionTodo. Before opening such a workspace with this build, finish or export the Tasks you still need, or copy the workspace's `runtime.sqlite` aside — the migration removes the only live copy, so afterwards recovery requires a backup made in advance.
 - Unified context management under one Runtime-owned policy. `MAKA_CONTEXT_*` environment overrides no longer tune or disable compaction and Tool Result pruning; model-visible archive placeholders are read on demand through bounded `ArchiveRead` calls instead of eager hydration. Previously supported overrides are ignored on upgrade: if Tool Result pruning was set to `off`, pruning is re-enabled, and there is currently no supported replacement opt-out.
 
 ## 0.1.11 - 2026-08-18

@@ -17,7 +17,7 @@
  * under the License.
  */
 
-import { deriveTurnRecords } from '@maka/core/session';
+import { deriveTurnRecords, isUserVisibleSessionSystemNote } from '@maka/core/session';
 import {
   isInFlightToolStatus,
   toolResultActivityStatus,
@@ -56,6 +56,8 @@ export interface ChatItem {
   ts?: number;
   /** User-message attachments projected from StoredMessage; absent on assistant/system rows. */
   attachments?: AttachmentRef[];
+  /** Host-bound directory references projected from StoredMessage; user rows only. */
+  directoryReferences?: import('@maka/core/events').DirectoryReference[];
   /** Inline quoted excerpts projected from StoredMessage; user rows only. */
   quotes?: QuoteRef[];
   /** Frozen inline token metadata projected from StoredMessage; user rows only. */
@@ -85,6 +87,12 @@ export interface ToolActivityItem {
   activityKind?: ToolActivityKind;
   displayName?: string;
   intent?: string;
+  /**
+   * Live-only bounded/redacted args subset from the Runtime Host wire (full
+   * args arrive with the durable transcript at turn end). Display formatters
+   * read `args ?? argsPreview`; never rendered as raw JSON.
+   */
+  argsPreview?: unknown;
   origin?: 'provider' | 'code_mode';
   modelVisibility?: 'visible' | 'hidden';
   parentToolCallId?: string;
@@ -132,16 +140,6 @@ export interface ToolActivityItem {
   shellRunSource?: "owned" | "unavailable";
 }
 
-// system_note kinds that we surface inline to the user. Everything else
-// (session_resume, connection_locked, mode_change-as-internal-audit, …)
-// stays in the JSONL audit trail but is hidden from the chat surface so
-// the conversation reads like a conversation, not a debug log.
-const VISIBLE_SYSTEM_NOTES = new Set<string>([
-  "context_compacted",
-  "context_compaction_failed_open",
-  "step_limit",
-]);
-
 function systemNoteLabel(kind: string, locale: UiLocale): string {
   const copy = getConversationCopy(locale).messages.systemNotes;
   if (kind === "context_compacted") return copy.contextCompacted;
@@ -168,6 +166,7 @@ export function materializeChat(
         ...(message.quotes && message.quotes.length > 0
           ? { quotes: message.quotes }
           : {}),
+        ...(message.directoryReferences ? { directoryReferences: message.directoryReferences } : {}),
         ...(message.inlineReferences !== undefined
           ? { inlineReferences: message.inlineReferences }
           : {}),
@@ -183,7 +182,7 @@ export function materializeChat(
       });
     if (
       message.type === "system_note" &&
-      VISIBLE_SYSTEM_NOTES.has(message.kind)
+      isUserVisibleSessionSystemNote(message.kind)
     ) {
       items.push({
         id: message.id,
@@ -768,7 +767,7 @@ export function materializeTurns(
       }
     } else if (
       message.type === "system_note" &&
-      VISIBLE_SYSTEM_NOTES.has(message.kind)
+      isUserVisibleSessionSystemNote(message.kind)
     ) {
       turn.notes.push({
         id: message.id,
@@ -1095,6 +1094,7 @@ function chatItemFromContent(
     ...(content.quotes && content.quotes.length > 0
       ? { quotes: content.quotes }
       : {}),
+    ...(content.directoryReferences ? { directoryReferences: content.directoryReferences } : {}),
     ...(content.inlineReferences !== undefined
       ? { inlineReferences: content.inlineReferences }
       : {}),

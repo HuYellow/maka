@@ -18,7 +18,9 @@
  */
 
 import type { RuntimeEvent } from '@maka/core/runtime-event';
-import { estimateRuntimeEventsTokens, estimateTokens } from './context-budget-helpers.js';
+import type { ContextBudgetExhaustedDetail } from '@maka/core/events';
+import { estimateTokens } from './context-budget-helpers.js';
+import { estimateRuntimeEventsTokens } from './model-history.js';
 
 // The single authority on what a history-compact checkpoint summary must look
 // like (#3029). The summarization prompt is built from the same constants and
@@ -34,10 +36,10 @@ import { estimateRuntimeEventsTokens, estimateTokens } from './context-budget-he
 export const SECTIONED_SUMMARY_FORMAT = 'sections_v1' as const;
 export type SectionedSummaryFormat = typeof SECTIONED_SUMMARY_FORMAT;
 
-export type CheckpointSummaryDefect =
-  | 'malformed_summary_missing_section'
-  | 'malformed_summary_truncated'
-  | 'malformed_summary_too_small_for_fold';
+export type CheckpointSummaryDefect = Extract<
+  ContextBudgetExhaustedDetail,
+  `malformed_summary_${string}`
+>;
 
 // The exact format the prompt mandates. REQUIRED_SUMMARY_SECTIONS is the
 // ordered subsequence of its headings a completion must carry to be allowed

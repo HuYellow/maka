@@ -67,7 +67,11 @@ export type {
   ConnectionTestTicket,
   InteractiveOAuthLoginCompletionResult,
   InteractiveOAuthLoginProvider,
+  InteractiveOAuthLoginInput,
+  InteractiveOAuthLoginTarget,
+  InteractiveOAuthConnectionIdentity,
   InteractiveOAuthLoginTicket,
+  QueryInteractiveOAuthLoginResult,
   CredentialStatusQueryResult,
   ModelFetchTicket,
   ProviderAuthKind,
@@ -238,15 +242,14 @@ function createWriterFacade(coordinator: RuntimePolicyCoordinator): RuntimePolic
         coordinator.getConnectionRequestHeaders(connectionId),
       replaceConnectionRequestHeaders: (connectionId, updates) =>
         coordinator.replaceConnectionRequestHeaders(connectionId, updates),
-      resolveExecutionConnection: (connectionSlug) =>
-        coordinator.resolveExecutionConnection(connectionSlug),
+      resolveExecutionConnection: (ref) => coordinator.resolveExecutionConnection(ref),
       resolveWebSearchExecution: (input) => coordinator.resolveWebSearchExecution(input),
       resolveWebFetchExecution: () => coordinator.resolveWebFetchExecution(),
       resolveNetworkProxyExecution: (input) => coordinator.resolveNetworkProxyExecution(input),
       compareAndSetOAuthCredential: (input) => coordinator.compareAndSetOAuthCredential(input),
       importConnectionCredential: (input) => coordinator.importConnectionCredential(input),
-      beginInteractiveOAuthLogin: (connectionId) =>
-        coordinator.beginInteractiveOAuthLogin(connectionId),
+      beginInteractiveOAuthLogin: (input) => coordinator.beginInteractiveOAuthLogin(input),
+      queryInteractiveOAuthLogin: (attemptId) => coordinator.queryInteractiveOAuthLogin(attemptId),
       completeInteractiveOAuthLogin: (ticket, secret) =>
         coordinator.completeInteractiveOAuthLogin(ticket, secret),
       beginModelFetch: (connectionId) => coordinator.beginModelFetch(connectionId),

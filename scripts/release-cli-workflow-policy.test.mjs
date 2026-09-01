@@ -46,8 +46,78 @@ test('validation consumers download the artifact produced by the build job', () 
   }
 });
 
+test('CLI validation qualifies exact published State Roots without weakening artifact identity', () => {
+  const workflow = readWorkflow('cli-package-validation.yml');
+  assert.match(
+    workflow,
+    /release_predecessor_version:[\s\S]*?value: \$\{\{ jobs\.release-predecessor\.outputs\.version \}\}/u,
+  );
+  assert.match(
+    workflow,
+    /release-predecessor:[\s\S]*?resolve-nightly-predecessor "\$GITHUB_OUTPUT"/u,
+  );
+  assert.match(
+    workflow,
+    /release_predecessor_integrity:[\s\S]*?jobs\.release-predecessor\.outputs\.integrity/u,
+  );
+  assert.match(
+    workflow,
+    /state-root-qualification:\n[\s\S]*?needs: \[build, release-predecessor\]/u,
+  );
+  assert.match(workflow, /source_sha256: [a-f0-9]{64}/u);
+  assert.match(workflow, /target_sha256: [a-f0-9]{64}/u);
+  assert.match(workflow, /epoch_relation: different/u);
+  assert.match(workflow, /epoch_relation: same/u);
+  const steps = workflowSteps(workflow);
+  const sandbox = namedStep(steps, 'Require the account-isolation sandbox');
+  assert.match(sandbox, /apt-get install --yes bubblewrap/u);
+  const qualify = namedStep(steps, 'Qualify the released State Root transition');
+  assert.match(qualify, /release:cli:qualify-state-root/u);
+  assert.match(qualify, /MAKA_QUALIFICATION_BWRAP_USE_SUDO:\s*'1'/u);
+  assert.match(qualify, /--source-sha256/u);
+  assert.match(qualify, /--target-sha256/u);
+  assert.match(qualify, /--expect-epoch-relation/u);
+  assert.match(qualify, /set -o pipefail/u);
+  assert.match(qualify, /npm run --silent/u);
+  const prepare = namedStep(steps, 'Prepare exact source and target artifacts');
+  assert.match(prepare, /--max-filesize 67108864/gu);
+  assert.match(prepare, /SOURCE_INTEGRITY/u);
+  assert.match(prepare, /createHash\('sha512'\)/u);
+  assert.match(prepare, /source_sha256="\$\(sha256sum/u);
+  const preserve = namedStep(steps, 'Preserve the qualification report');
+  assert.match(preserve, /if-no-files-found: error/u);
+  const freshness = namedStep(steps, 'Require the qualified Nightly predecessor to remain current');
+  assert.match(freshness, /assert-nightly-predecessor/u);
+  assert.match(freshness, /needs\.release-predecessor\.outputs\.version/u);
+  assert.ok(steps.indexOf(freshness) > steps.indexOf(preserve));
+  assert.match(
+    workflow,
+    /source_url: \$\{\{ needs\.release-predecessor\.outputs\.tarball_url \}\}/u,
+  );
+});
+
+test('npm mutations revalidate the exact qualified Nightly predecessor', () => {
+  const nightly = readWorkflow('npm-publication.yml');
+  const nightlyFence = namedStep(
+    workflowSteps(nightly),
+    'Require the qualified predecessor and Nightly channel advance',
+  );
+  assert.match(nightlyFence, /needs\.cli\.outputs\.release_predecessor_version/u);
+  assert.match(nightlyFence, /needs\.cli\.outputs\.release_predecessor_integrity/u);
+  assert.match(nightlyFence, /assert-nightly-predecessor/u);
+  assert.ok(nightly.indexOf(nightlyFence) < nightly.indexOf('npm publish'));
+
+  const stage = readWorkflow('release-cli-stage.yml');
+  const submit = namedStep(workflowSteps(stage), 'Submit the candidate to npm staging');
+  assert.match(submit, /needs\.validate\.outputs\.release_predecessor_version/u);
+  assert.match(submit, /needs\.validate\.outputs\.release_predecessor_integrity/u);
+  assert.match(submit, /assert-nightly-predecessor/u);
+  assert.ok(submit.indexOf('assert-nightly-predecessor') < submit.indexOf('npm stage publish'));
+});
+
 test('stage consumes the validated artifact and makes provenance staging the final step', () => {
   const workflow = readWorkflow('release-cli-stage.yml');
+  assert.match(workflow, /environment:\n\s+name: npm-publication/u);
   const steps = workflowSteps(workflow);
   const download = namedStep(steps, 'Download the validated release candidate');
   assert.match(
@@ -55,9 +125,7 @@ test('stage consumes the validated artifact and makes provenance staging the fin
     /artifact-ids: \$\{\{ needs\.validate\.outputs\.release_candidate_artifact_id \}\}/u,
   );
   assert.match(workflow, /RELEASE_RUN_ATTEMPT/u);
-  const guidance = namedStep(steps, 'Record the post-staging approval step');
-  assert.match(guidance, /if \[\[ "\$RELEASE_DIST_TAG" == "latest" \]\]/u);
-  assert.match(guidance, /npm dist-tag add/u);
+  namedStep(steps, 'Record the post-staging approval step');
   const submit = namedStep(steps, 'Submit the candidate to npm staging');
   assert.equal(steps.at(-1), submit);
   assert.match(submit, /product-release-authority\.mjs verify-draft/u);
@@ -66,28 +134,41 @@ test('stage consumes the validated artifact and makes provenance staging the fin
   assert.match(submit, /--provenance/u);
 });
 
-test('stage builds the npm candidate from the exact product release commit', () => {
+test('stage builds product data without executing it under npm OIDC', () => {
   const workflow = readWorkflow('release-cli-stage.yml');
-  const authorizeSteps = workflowSteps(workflow);
-  const checkout = authorizeSteps.find((step) => step.includes('uses: actions/checkout@'));
-  assert.match(checkout, /ref: v\$\{\{ inputs\.version \}\}/u);
-  assert.match(workflow, /RELEASE_REF.*refs\/tags\/\$PRODUCT_TAG/su);
+  const authorize = workflow.slice(
+    workflow.indexOf('\n  authorize:'),
+    workflow.indexOf('\n  validate:'),
+  );
+  const authorizeSteps = workflowSteps(authorize);
+  const checkouts = authorizeSteps.filter((step) => step.includes('uses: actions/checkout@'));
+  assert.equal(checkouts.length, 2);
+  assert.match(checkouts[0], /ref: \$\{\{ github\.sha \}\}/u);
+  assert.match(checkouts[1], /ref: v\$\{\{ inputs\.version \}\}/u);
+  assert.match(checkouts[1], /path: product-source/u);
+  assert.match(workflow, /RELEASE_REF.*refs\/heads\/main/su);
   assert.match(workflow, /source_commit: \$\{\{ steps\.product\.outputs\.source_commit \}\}/u);
   assert.match(
     workflow,
     /needs: authorize\n\s+uses: \.\/\.github\/workflows\/cli-package-validation\.yml/u,
   );
   assert.match(workflow, /source_commit: \$\{\{ needs\.authorize\.outputs\.source_commit \}\}/u);
-  assert.match(workflow, /ref: \$\{\{ needs\.authorize\.outputs\.source_commit \}\}/u);
+  const stageCheckout = namedStep(workflowSteps(workflow), 'Check out trusted staging code');
+  assert.match(stageCheckout, /ref: \$\{\{ github\.sha \}\}/u);
   assert.match(workflow, /product-release-authority\.mjs verify-draft/u);
   assert.match(workflow, /EXPECTED_PRODUCT_VERSION/u);
   assert.doesNotMatch(workflow, /EXPECTED_PRODUCT_TAG|EXPECTED_PRODUCT_SOURCE_COMMIT/u);
-  assert.match(workflow, /RELEASE_SHA: \$\{\{ github\.sha \}\}/u);
+  assert.match(
+    workflow,
+    /PRODUCT_SOURCE_SHA: \$\{\{ needs\.authorize\.outputs\.source_commit \}\}/u,
+  );
+  assert.match(workflow, /PUBLISHER_SHA: \$\{\{ github\.sha \}\}/u);
+  assert.match(workflow, /RELEASE_WORKFLOW: \.github\/workflows\/npm-publication\.yml/u);
   const bind = namedStep(workflowSteps(workflow), 'Bind the candidate to this workflow run');
   assert.match(bind, /PRODUCT_TAG: \$\{\{ needs\.authorize\.outputs\.product_tag \}\}/u);
 });
 
-test('finalize validates one exact stage attempt before running the current verifier', () => {
+test('finalize runs the current verifier from reviewed main against exact build evidence', () => {
   const workflow = readWorkflow('release-cli-finalize.yml');
   const steps = workflowSteps(workflow);
   assert.match(workflow, /stage_run_attempt:[\s\S]*?required: true/u);
@@ -95,8 +176,12 @@ test('finalize validates one exact stage attempt before running the current veri
   const checkoutIndex = workflow.indexOf('uses: actions/checkout@');
   assert.ok(loadIndex >= 0 && checkoutIndex > loadIndex);
   assert.match(workflow, /actions\/runs\/\$STAGE_RUN_ID\/attempts\/\$STAGE_RUN_ATTEMPT/u);
+  assert.match(workflow, /release_run_attempt:[\s\S]*?required: true/u);
+  assert.match(workflow, /actions\/runs\/\$RELEASE_RUN_ID\/attempts\/\$RELEASE_RUN_ATTEMPT/u);
   const checkout = namedStep(steps, 'Check out the current release verifier');
   assert.match(checkout, /ref: \$\{\{ github\.sha \}\}/u);
+  const requireMain = namedStep(steps, 'Require main');
+  assert.match(requireMain, /refs\/heads\/main/u);
 });
 
 test('finalize revalidates the live product release before trusting public npm bytes', () => {
@@ -106,22 +191,48 @@ test('finalize revalidates the live product release before trusting public npm b
   assert.match(record, /id: release/u);
   assert.match(record, /"\$GITHUB_OUTPUT"/u);
   const authority = namedStep(steps, 'Revalidate the product release authority');
+  assert.match(authority, /product-release-authority\.mjs verify-build-run/u);
+  assert.match(authority, /product-release-artifacts\.mjs inspect-record/u);
   assert.match(authority, /product-release-authority\.mjs verify-draft/u);
   assert.ok(
     workflow.indexOf(authority) < workflow.indexOf('Fetch and verify the public registry bytes'),
   );
 });
 
-test('finalize preserves verified npm bytes without creating another product release', () => {
+test('finalize preserves npm evidence and owns the single product publication boundary', () => {
   const workflow = readWorkflow('release-cli-finalize.yml');
+  const steps = workflowSteps(workflow);
   assert.match(workflow, /name: Preserve the verified public npm package/u);
   assert.match(workflow, /path: \$\{\{ runner\.temp \}\}\/registry-release/u);
-  assert.doesNotMatch(workflow, /cli-v|contents: write/u);
+  assert.doesNotMatch(workflow, /cli-v/u);
+  assert.match(workflow, /name: product-release/u);
+  assert.match(workflow, /contents: write/u);
+  assert.match(workflow, /id-token: write/u);
+  assert.match(workflow, /attestations: write/u);
+  assert.match(workflow, /product-release-authority\.mjs publish-draft/u);
+  assert.match(workflow, /actions\/attest@[0-9a-f]{40}/u);
+  const artifacts = namedStep(steps, 'Download the exact verified Release run artifacts');
+  assert.match(artifacts, /run-id: \$\{\{ needs\.inspect\.outputs\.release_run_id \}\}/u);
+  const preflight = namedStep(steps, 'Verify the exact publication input');
+  const attest = steps.find((step) => step.includes('uses: actions/attest@'));
+  const verify = namedStep(steps, 'Verify the issued provenance');
+  const publish = namedStep(steps, 'Publish the verified convenience release');
+  assert.ok(attest);
+  assert.ok(
+    workflow.indexOf(preflight) < workflow.indexOf(attest) &&
+      workflow.indexOf(attest) < workflow.indexOf(verify) &&
+      workflow.indexOf(verify) < workflow.indexOf(publish),
+  );
+  assert.match(preflight, /product-release-authority\.mjs verify-publication/u);
+  assert.match(verify, /gh attestation verify/u);
+  assert.match(verify, /@refs\/heads\/main/u);
+  assert.doesNotMatch(workflow.slice(workflow.indexOf('\n  publish:')), /\$\{\{ inputs\./u);
 });
 
 test('release workflows select npm from the root packageManager authority', () => {
   for (const name of [
     'cli-package-validation.yml',
+    'npm-publication.yml',
     'release-cli-stage.yml',
     'release-cli-finalize.yml',
   ]) {

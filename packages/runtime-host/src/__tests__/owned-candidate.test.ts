@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -394,7 +395,11 @@ test('owned hosted execution closes its fresh Host after configuration fails', a
       executionId: '00000000-0000-4000-8000-000000000002',
       session: {
         workspace: { kind: 'host_path', path: rootPath },
-        modelTarget: { kind: 'explicit', connectionSlug: 'missing', model: 'missing' },
+        modelTarget: {
+          kind: 'explicit',
+          connectionSlug: 'missing',
+          model: 'missing',
+        },
       },
       content: { text: 'This request must not reach a provider.' },
     },
@@ -452,15 +457,4 @@ async function waitForDefined<T>(
       setTimeout(resolve, 20);
     });
   }
-}
-
-function deferred<T>(): {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
 }

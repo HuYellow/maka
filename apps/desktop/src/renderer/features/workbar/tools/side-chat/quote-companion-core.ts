@@ -26,6 +26,7 @@ import {
   type LiveTurnProjection,
 } from '@maka/ui';
 import type { PermissionMode } from '@maka/core/permission';
+import type { ChatModelChoice } from '@maka/core/chat-model-choice';
 import type { QuoteRef, SessionEvent } from '@maka/core/events';
 import type { SessionSummary, TurnRecord } from '@maka/core/session';
 import type { UiLocale } from '@maka/core/ui-locale';
@@ -55,6 +56,21 @@ export type CompanionErrorCode =
   | 'fork_unsupported'
   | 'send_failed'
   | 'send_rejected';
+
+export function sessionHasExactModelChoice(
+  session: SessionSummary | undefined,
+  choices: readonly ChatModelChoice[],
+): boolean {
+  return Boolean(
+    session?.llmConnectionId &&
+    choices.some(
+      (choice) =>
+        choice.connectionId === session.llmConnectionId &&
+        choice.connectionSlug === session.llmConnectionSlug &&
+        choice.model === session.model,
+    ),
+  );
+}
 
 export type EnsureCompanionForkResult =
   | { status: 'ready'; session: SessionSummary }
@@ -422,9 +438,11 @@ export function applyCompanionInteractionEvent(
 ): InteractionQueues {
   switch (event.type) {
     case 'sandbox_boundary_request':
+    case 'client_capability_request':
     case 'user_question_request':
       return enqueueInteraction(queues, sessionId, event);
     case 'sandbox_boundary_decision_ack':
+    case 'client_capability_decision_ack':
       return dequeueInteractionByRequestId(queues, sessionId, event.requestId);
     case 'tool_result':
       return dequeueInteractionByToolUseId(queues, sessionId, event.toolUseId);

@@ -19,6 +19,7 @@
 
 import { truncateUtf8 } from '@maka/core/diagnostic-log';
 import { redactSecrets } from '@maka/core/redaction';
+import type { RootTurnAdmissionAuthorization } from '@maka/storage/execution-stores';
 import {
   HOST_OPERATION_SPECS,
   decodeOperationOutcome,
@@ -33,12 +34,20 @@ import {
 } from '../protocol/index.js';
 import { HOST_BOOTSTRAP_OPERATION_SPECS } from '../protocol/host-status.js';
 import { ACCESS_AUTHORITY_OPERATION_SPECS } from '../protocol/access-authority.js';
+import { SESSION_COLLABORATION_OPERATION_SPECS } from '../protocol/session-collaboration.js';
+import { PEER_MESH_OPERATION_SPECS } from '../protocol/peer-mesh.js';
+import { createPeerMeshOperationHandlers } from './peer-mesh-authority.js';
+import type { RuntimeHostConnectionAuthority } from './connection-authority.js';
 
 export interface ConnectionContext {
   hostEpoch: string;
   connectionId: string;
   principal: string;
+  principalKind?: RuntimeHostConnectionAuthority['principalKind'];
   credentialId?: string;
+  credentialClientInstanceId?: string;
+  clientInstanceId?: string;
+  turnAdmissionAuthorization?: RootTurnAdmissionAuthorization;
   acquireResidency(): OperationResidency;
 }
 
@@ -57,7 +66,9 @@ export type OperationHandlerMap = {
 
 export type HostCoreOperationKey =
   | keyof typeof HOST_BOOTSTRAP_OPERATION_SPECS
-  | keyof typeof ACCESS_AUTHORITY_OPERATION_SPECS;
+  | keyof typeof ACCESS_AUTHORITY_OPERATION_SPECS
+  | keyof typeof SESSION_COLLABORATION_OPERATION_SPECS
+  | keyof typeof PEER_MESH_OPERATION_SPECS;
 export type DomainOperationKey = Exclude<OperationKey, HostCoreOperationKey>;
 export type TurnOperationKey = Extract<
   OperationKey,
@@ -86,6 +97,7 @@ export type ConnectionEffectOperationKey = Extract<
 export type MessageOperationKey = Extract<
   OperationKey,
   | 'turn.message.query'
+  | 'turn.message.execution.query'
   | 'turn.message.submit'
   | 'queue.retract'
   | 'queue.entry.retract'
@@ -113,17 +125,18 @@ export type SessionRevisionOperationKey = Extract<
 >;
 export type SessionRetirementOperationKey = Extract<
   OperationKey,
-  'session.lifecycle.set' | 'session.remove'
+  'session.lifecycle.set' | 'session.remove' | 'session.remove.preview'
 >;
 export type SessionEffectOperationKey = Extract<OperationKey, 'session.recap.generate'>;
+export type SessionTodoOperationKey = Extract<OperationKey, 'session.todo.query'>;
 export type SessionCatalogOperationKey = Exclude<
   Extract<OperationKey, `session.${string}`>,
   | SessionContinuityOperationKey
   | SessionRevisionOperationKey
   | SessionRetirementOperationKey
   | SessionEffectOperationKey
+  | SessionTodoOperationKey
 >;
-export type TaskLedgerOperationKey = Extract<OperationKey, 'task.ledger.query'>;
 export type ArtifactOperationKey = Extract<OperationKey, `artifact.${string}`>;
 export type SkillCatalogOperationKey = Extract<OperationKey, `skill.catalog.${string}`>;
 export type UsagePricingOperationKey = Extract<OperationKey, 'usage.query' | `pricing.${string}`>;
@@ -140,6 +153,7 @@ export type WebSearchOperationKey = Extract<OperationKey, `web-search.${string}`
 export type NetworkProxyOperationKey = Extract<OperationKey, `network-proxy.${string}`>;
 export type ConfigurationOperationKey = Extract<OperationKey, `configuration.${string}`>;
 export type WorkHubCoordinationOperationKey = Extract<OperationKey, `workhub.${string}`>;
+export type PluginPlatformOperationKey = Extract<OperationKey, `plugin.${string}`>;
 export type DomainOperationHandlerMap = Pick<OperationHandlerMap, DomainOperationKey>;
 export type TurnOperationHandlerMap = Pick<OperationHandlerMap, TurnOperationKey>;
 export type ContextOperationHandlerMap = Pick<OperationHandlerMap, ContextOperationKey>;
@@ -181,7 +195,7 @@ export type SessionRetirementOperationHandlerMap = Pick<
   SessionRetirementOperationKey
 >;
 export type SessionEffectOperationHandlerMap = Pick<OperationHandlerMap, SessionEffectOperationKey>;
-export type TaskLedgerOperationHandlerMap = Pick<OperationHandlerMap, TaskLedgerOperationKey>;
+export type SessionTodoOperationHandlerMap = Pick<OperationHandlerMap, SessionTodoOperationKey>;
 export type ArtifactOperationHandlerMap = Pick<OperationHandlerMap, ArtifactOperationKey>;
 export type SkillCatalogOperationHandlerMap = Pick<OperationHandlerMap, SkillCatalogOperationKey>;
 export type UsagePricingOperationHandlerMap = Pick<OperationHandlerMap, UsagePricingOperationKey>;
@@ -210,10 +224,16 @@ export type WorkHubCoordinationOperationHandlerMap = Pick<
   OperationHandlerMap,
   WorkHubCoordinationOperationKey
 >;
+export type PluginPlatformOperationHandlerMap = Pick<
+  OperationHandlerMap,
+  PluginPlatformOperationKey
+>;
 export type AccessAuthorityOperationHandlerMap = Pick<
   OperationHandlerMap,
-  keyof typeof ACCESS_AUTHORITY_OPERATION_SPECS
+  keyof typeof ACCESS_AUTHORITY_OPERATION_SPECS | keyof typeof SESSION_COLLABORATION_OPERATION_SPECS
 >;
+export type HostCoreUnavailableOperationHandlerMap = AccessAuthorityOperationHandlerMap &
+  Pick<OperationHandlerMap, keyof typeof PEER_MESH_OPERATION_SPECS>;
 
 export function composeOperationHandlers(
   ...handlerMaps: readonly Partial<OperationHandlerMap>[]
@@ -246,7 +266,9 @@ export function createUnavailableDomainOperationHandlers(): DomainOperationHandl
   for (const operation of Object.keys(HOST_OPERATION_SPECS) as OperationKey[]) {
     if (
       Object.hasOwn(HOST_BOOTSTRAP_OPERATION_SPECS, operation) ||
-      Object.hasOwn(ACCESS_AUTHORITY_OPERATION_SPECS, operation)
+      Object.hasOwn(ACCESS_AUTHORITY_OPERATION_SPECS, operation) ||
+      Object.hasOwn(SESSION_COLLABORATION_OPERATION_SPECS, operation) ||
+      Object.hasOwn(PEER_MESH_OPERATION_SPECS, operation)
     ) {
       continue;
     }
@@ -297,6 +319,13 @@ export function createUnavailableAccessAuthorityOperationHandlers(): AccessAutho
         message: 'Runtime Host access credentials are unavailable',
       },
     }),
+    'access.principal.revoke': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host access credentials are unavailable',
+      },
+    }),
     'access.credential.rotation.prepare': async () => ({
       ok: false,
       error: {
@@ -318,6 +347,69 @@ export function createUnavailableAccessAuthorityOperationHandlers(): AccessAutho
         message: 'Runtime Host access credentials are unavailable',
       },
     }),
+    'collaboration.invitation.prepare': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.access.query': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.grant.revoke': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.principal.revoke': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.turn-request.create': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.turn-request.acknowledge': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.turn-request.query': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+    'collaboration.turn-request.decide': async () => ({
+      ok: false,
+      error: {
+        code: 'operation_unavailable',
+        message: 'Runtime Host collaboration authority is unavailable',
+      },
+    }),
+  };
+}
+
+export function createUnavailableHostCoreOperationHandlers(): HostCoreUnavailableOperationHandlerMap {
+  return {
+    ...createUnavailableAccessAuthorityOperationHandlers(),
+    ...createPeerMeshOperationHandlers(undefined),
   };
 }
 

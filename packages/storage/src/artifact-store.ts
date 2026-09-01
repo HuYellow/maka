@@ -78,7 +78,9 @@ export const ARTIFACT_TEXT_PREVIEW_LIMIT_BYTES = 10 * 1024 * 1024;
 export const ARTIFACT_BINARY_PREVIEW_LIMIT_BYTES = 50 * 1024 * 1024;
 
 const PURGE_INTENT_SCHEMA_VERSION = 1 as const;
+
 const MAX_PURGE_INTENT_BYTES = 64 * 1024 * 1024;
+const ARTIFACT_PURGE_RESOLVE_CONCURRENCY = 8;
 const EMPTY_SESSION_SNAPSHOT: ArtifactSessionSnapshot = {
   records: [],
   revision: artifactListRevision([]),
@@ -159,6 +161,14 @@ export interface ConversationArtifactCopyInput {
   readonly targetSessionId: string;
   readonly turnIds: readonly string[];
   readonly excludeArtifactIds?: readonly string[];
+  /**
+   * Source-Session artifact ids to copy in addition to the turn-scoped
+   * selection, regardless of their `turnId`. Used to carry user-uploaded
+   * attachments (whose `turnId` is the upload id sentinel, not a conversation
+   * turn) that the copied transcript still references. Lenient: an id with no
+   * matching source record is a no-op.
+   */
+  readonly includeArtifactIds?: readonly string[];
   readonly linkedArtifacts?: readonly {
     readonly sessionId: string;
     readonly artifactIds: readonly string[];
@@ -389,6 +399,7 @@ class SqliteArtifactStore implements ArtifactAuthorityStore {
     }
     const turnIds = new Set(input.turnIds);
     const excludedArtifactIds = new Set(input.excludeArtifactIds ?? []);
+    const includedArtifactIds = new Set(input.includeArtifactIds ?? []);
     for (const turnId of turnIds) assertArtifactTurnKey(turnId);
     const linkedArtifacts = input.linkedArtifacts ?? [];
     const requestedLinkedArtifactIds = new Map<string, Set<string>>();
@@ -424,6 +435,18 @@ class SqliteArtifactStore implements ArtifactAuthorityStore {
           );
           if (!record) throw new Error(`Linked Artifact ${artifactId} could not be copied`);
           selected.push({ ...record });
+        }
+      }
+      const selectedIds = new Set(selected.map((record) => record.id));
+      for (const record of this.records) {
+        if (
+          record.sessionId === input.sourceSessionId &&
+          includedArtifactIds.has(record.id) &&
+          !excludedArtifactIds.has(record.id) &&
+          !selectedIds.has(record.id)
+        ) {
+          selected.push({ ...record });
+          selectedIds.add(record.id);
         }
       }
       return selected;
@@ -883,28 +906,75 @@ class SqliteArtifactStore implements ArtifactAuthorityStore {
     const relativePaths = new Map(records.map((record) => [record.relativePath, record] as const));
     for (const record of records) {
       validateRelativeArtifactPath(record.relativePath);
-      const entry = await resolveArtifactRemovalEntry(this.artifactRoot, record.relativePath);
+    }
+    const purgeEntries = await this.resolveRemovalEntriesUnlocked(records);
+    for (const [index, record] of records.entries()) {
+      const entry = purgeEntries[index];
       if (!entry) continue;
       if (!isInsideOrSamePath(root, dirname(entry.unlinkPath))) {
         throw new Error(`Artifact ${record.id} resolves outside the artifact root`);
       }
       entries.set(entry.comparisonIdentity, { unlinkPath: entry.unlinkPath, record });
     }
-    for (const record of this.records) {
-      if (ids.has(record.id)) continue;
+    const guardRecords = this.records.filter((record) => !ids.has(record.id));
+    for (const record of guardRecords) {
       const exactTarget = relativePaths.get(record.relativePath);
       if (exactTarget) {
         throw new Error(
           `Artifact ${exactTarget.id} path is still referenced by artifact ${record.id}`,
         );
       }
-      const entry = await resolveArtifactRemovalEntry(this.artifactRoot, record.relativePath);
+    }
+    const guardEntries = await this.resolveRemovalEntriesUnlocked(guardRecords);
+    for (const [index, record] of guardRecords.entries()) {
+      const entry = guardEntries[index];
       const target = entry ? entries.get(entry.comparisonIdentity)?.record : undefined;
       if (target) {
         throw new Error(`Artifact ${target.id} path is still referenced by artifact ${record.id}`);
       }
     }
     return [...entries.values()].map((entry) => entry.unlinkPath);
+  }
+
+  // Resolves removal entries with bounded concurrency: each resolution issues
+  // realpath/lstat syscalls, so a serial loop over the full record set turned
+  // session-cleanup purges into a syscall storm on large artifact stores.
+  // Workers capture per-record results and always drain the queue, so all
+  // filesystem work settles before this mutation releases the writer lock,
+  // and resolver failures surface in record order rather than completion
+  // order.
+  private async resolveRemovalEntriesUnlocked(
+    records: readonly ArtifactRecord[],
+  ): Promise<readonly (ArtifactRemovalEntry | undefined)[]> {
+    type Resolution =
+      | { readonly ok: true; readonly entry: ArtifactRemovalEntry | undefined }
+      | { readonly ok: false; readonly error: unknown };
+    const results: (Resolution | undefined)[] = new Array(records.length);
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < records.length) {
+        const index = nextIndex++;
+        try {
+          const entry = await resolveArtifactRemovalEntry(
+            this.artifactRoot,
+            records[index]!.relativePath,
+          );
+          results[index] = { ok: true, entry };
+        } catch (error) {
+          results[index] = { ok: false, error };
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(ARTIFACT_PURGE_RESOLVE_CONCURRENCY, records.length) }, worker),
+    );
+    const resolved: (ArtifactRemovalEntry | undefined)[] = new Array(records.length);
+    for (const [index, result] of results.entries()) {
+      if (result === undefined) throw new Error('Artifact removal resolution did not settle');
+      if (!result.ok) throw result.error;
+      resolved[index] = result.entry;
+    }
+    return resolved;
   }
 
   private async completePurgeUnlocked(

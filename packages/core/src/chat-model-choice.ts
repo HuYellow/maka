@@ -19,12 +19,17 @@
 
 import { normalizeOpenAiCodexConnection } from './connection-readiness.js';
 import { buildConnectionModelCatalogEntries } from './model-catalog.js';
-import { thinkingVariantsForConnection, type ThinkingLevel } from './model-thinking.js';
+import { resolveModelVisionSupport } from './model-metadata.js';
+import {
+  relayModelProfile,
+  thinkingVariantsForConnection,
+  type ThinkingLevel,
+} from './model-thinking.js';
 import {
   CODEX_SUBSCRIPTION_UNSUPPORTED_CHATGPT_MODELS,
   connectionEnabledModelIds,
   providerDefaultsOf,
-  type LlmConnection,
+  type IdentifiedLlmConnection,
   type ProviderType,
 } from './llm-connections.js';
 
@@ -42,6 +47,7 @@ const MODEL_MENU_PROVIDER_LABELS: Partial<Record<ProviderType, string>> = {
 };
 
 export interface ChatModelChoice {
+  connectionId: string;
   connectionSlug: string;
   providerType: ProviderType;
   providerLabel: string;
@@ -52,9 +58,13 @@ export interface ChatModelChoice {
   connectionName?: string;
   isDefault: boolean;
   thinkingLevels: readonly ThinkingLevel[];
+  /** Exact capability projection used by model-facing attachment composition. */
+  supportsVision?: boolean;
 }
 
-export function buildChatModelChoices(connections: readonly LlmConnection[]): ChatModelChoice[] {
+export function buildChatModelChoices(
+  connections: readonly IdentifiedLlmConnection[],
+): ChatModelChoice[] {
   const choices: ChatModelChoice[] = [];
   for (const rawConnection of connections) {
     const connection = normalizeOpenAiCodexConnection(rawConnection);
@@ -73,6 +83,7 @@ export function buildChatModelChoices(connections: readonly LlmConnection[]): Ch
         continue;
       }
       choices.push({
+        connectionId: rawConnection.connectionId,
         connectionSlug: connection.slug,
         providerType: connection.providerType,
         providerLabel: MODEL_MENU_PROVIDER_LABELS[connection.providerType] ?? provider.label,
@@ -83,6 +94,12 @@ export function buildChatModelChoices(connections: readonly LlmConnection[]): Ch
         ...(provider.authKind === 'oauth_token' ? {} : { connectionName: connection.name }),
         isDefault: entry.isDefault,
         thinkingLevels: thinkingVariantsForConnection(connection, entry.id),
+        supportsVision: resolveModelVisionSupport(
+          connection.providerType,
+          connection.models,
+          entry.id,
+          relayModelProfile(connection, entry.id)?.vision,
+        ),
       });
     }
   }

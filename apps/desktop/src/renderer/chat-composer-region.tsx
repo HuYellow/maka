@@ -18,8 +18,16 @@
  */
 
 import { useLayoutEffect, useRef, type ComponentProps, type RefObject } from 'react';
-import { Button, Composer, SandboxBoundaryPrompt, UserQuestionPrompt, Banner } from '@maka/ui';
+import {
+  Banner,
+  Button,
+  ClientCapabilityPrompt,
+  Composer,
+  SandboxBoundaryPrompt,
+  UserQuestionPrompt,
+} from '@maka/ui';
 import type { ComposerHandle, ComposerInteraction } from '@maka/ui';
+import { useComposerMentionsContext } from './composer-mentions.js';
 import {
   readNewTaskReloadDraft,
   readNewTaskReloadIntent,
@@ -67,7 +75,23 @@ interface BoundaryUnreadableNotice {
  * `draftKey`, and `stopPending` are derived here from the active-session state
  * so AppShell only forwards the orchestration callbacks and the session maps.
  */
-interface ChatComposerRegionProps extends Omit<ComponentProps<typeof Composer>, 'hidden' | 'draftKey' | 'stopPending'> {
+interface ChatComposerRegionProps
+  extends Omit<
+    ComponentProps<typeof Composer>,
+    | 'hidden'
+    | 'draftKey'
+    | 'stopPending'
+    | 'allowAttachmentImportWhileStreaming'
+    // Read from ComposerMentionsProvider, so a catalog reload repaints the
+    // popups without re-rendering the shell that would otherwise pass them.
+    | 'mentionSkills'
+    | 'mentionSkillsUnavailable'
+    | 'mentionSkillsLoading'
+    | 'onSearchMentionFiles'
+    | 'pendingDirectories'
+    | 'onRemoveDirectory'
+    | 'onPickDirectory'
+  > {
   composerRef: RefObject<ComposerHandle | null>;
   active: boolean;
   onboardingComposerHidden: boolean;
@@ -78,11 +102,15 @@ interface ChatComposerRegionProps extends Omit<ComponentProps<typeof Composer>, 
   newTaskSendPending: boolean;
   stopPendingBySession: Record<string, boolean>;
   respondToSandboxBoundary: ComponentProps<typeof SandboxBoundaryPrompt>['onRespond'];
-  activeSandboxBoundary: ComponentProps<typeof SandboxBoundaryPrompt>['request'] | undefined;
-  activeQuestion: ComponentProps<typeof UserQuestionPrompt>['request'] | undefined;
+  respondToClientCapability: ComponentProps<typeof ClientCapabilityPrompt>['onRespond'];
   respondToUserQuestion: ComponentProps<typeof UserQuestionPrompt>['onRespond'];
   stop: ComponentProps<typeof UserQuestionPrompt>['onStop'];
   boundaryUnreadableNotice?: BoundaryUnreadableNotice;
+  directoryComposerProps: Pick<
+    ComponentProps<typeof Composer>,
+    'pendingDirectories' | 'onRemoveDirectory' | 'onPickDirectory'
+  >;
+  directoryPickerEnabled: boolean;
 }
 
 export function ChatComposerRegion({
@@ -95,13 +123,20 @@ export function ChatComposerRegion({
   newTaskSendPending,
   stopPendingBySession,
   respondToSandboxBoundary,
-  activeSandboxBoundary,
-  activeQuestion,
+  respondToClientCapability,
   respondToUserQuestion,
   stop,
   boundaryUnreadableNotice,
+  directoryComposerProps,
+  directoryPickerEnabled,
   ...composerRest
 }: ChatComposerRegionProps) {
+  const mentions = useComposerMentionsContext();
+  const activeSandboxBoundary =
+    activeInteraction?.type === 'sandbox_boundary_request' ? activeInteraction : undefined;
+  const activeClientCapability =
+    activeInteraction?.type === 'client_capability_request' ? activeInteraction : undefined;
+  const activeQuestion = activeInteraction?.type === 'user_question_request' ? activeInteraction : undefined;
   const previousNewTaskDraftKey = useRef(newTaskDraftKey);
   useLayoutEffect(() => {
     const previous = previousNewTaskDraftKey.current;
@@ -191,6 +226,12 @@ export function ChatComposerRegion({
             onRespond={respondToSandboxBoundary}
           />
         )}
+        {activeClientCapability && (
+          <ClientCapabilityPrompt
+            request={activeClientCapability}
+            onRespond={respondToClientCapability}
+          />
+        )}
         {activeQuestion && (
           <UserQuestionPrompt
             request={activeQuestion}
@@ -203,6 +244,18 @@ export function ChatComposerRegion({
       <Composer
         ref={composerRef}
         {...composerRest}
+        // AppShell carries staged attachments into both queued and steering
+        // follow-ups. Other Composer hosts remain gated by default because a
+        // text-only running-turn submission would leave attachments behind.
+        allowAttachmentImportWhileStreaming
+        mentionSkills={mentions?.mentionSkills}
+        mentionSkillsUnavailable={mentions?.mentionSkillsUnavailable}
+        mentionSkillsLoading={mentions?.mentionSkillsLoading}
+        onSearchMentionFiles={mentions?.searchMentionFiles}
+        {...directoryComposerProps}
+        onPickDirectory={
+          directoryPickerEnabled ? directoryComposerProps.onPickDirectory : undefined
+        }
         hidden={!active || onboardingComposerHidden || Boolean(activeInteraction)}
         draftKey={activeId ?? newTaskDraftKey}
         draftPersistence={newTaskDraftPersistence}

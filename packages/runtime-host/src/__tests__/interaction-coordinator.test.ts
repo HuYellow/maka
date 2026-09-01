@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -48,6 +49,7 @@ import {
 import type { SessionInteractionProjection } from '../protocol/index.js';
 import type { ConnectionContext } from '../server/operation-dispatcher.js';
 import {
+  ClientCapabilityApprovalClosedError,
   HostInteractionCoordinator,
   type HostInteractionCoordinatorOptions,
 } from '../server/interaction-coordinator.js';
@@ -118,12 +120,56 @@ describe('HostInteractionCoordinator', () => {
     });
   });
 
+  test('closes a pending Client Capability approval when its provider disconnects', async () => {
+    await withStore(async ({ store }) => {
+      const coordinator = createCoordinator(store);
+      const owner = coordinator.bindRun(RUN);
+      const provider = new AbortController();
+      const approval = coordinator.requestClientCapabilityApproval({
+        ...RUN,
+        toolCallId: 'browser-call-disconnected',
+        providerSignal: provider.signal,
+        target: {
+          providerId: 'provider-1',
+          contractId: 'contract-1',
+          serverId: 'desktop_browser',
+          toolName: 'browser_snapshot',
+          capability: 'browser',
+          scope: { kind: 'browser_origin', origin: 'https://example.com' },
+        },
+      });
+      let pending = await store.listSessionPending(RUN.sessionId);
+      while (pending.length === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+        pending = await store.listSessionPending(RUN.sessionId);
+      }
+
+      provider.abort();
+      await assert.rejects(
+        approval,
+        (error: unknown) =>
+          error instanceof ClientCapabilityApprovalClosedError &&
+          error.reason === 'provider_disconnected',
+      );
+      const record = await store.readInteraction(pending[0]?.requestId ?? 'missing');
+      assert.equal(record?.outcome?.outcome.kind, 'closure');
+      if (record?.outcome?.outcome.kind === 'closure') {
+        assert.equal(record.outcome.outcome.reason, 'provider_disconnected');
+      }
+
+      await owner.close('turn_terminal');
+      owner.release();
+      await coordinator.close();
+    });
+  });
+
   test('settles a sandbox boundary once through the canonical boundary Store and wakes its graph', async () => {
     await withStore(async ({ owner, store, stores }) => {
       const workspace = join(owner.capability.canonicalPath, 'workspace');
       await mkdir(workspace);
       const session = await stores.sessionStore.create({
         cwd: workspace,
+        llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
         llmConnectionSlug: 'fake',
         model: 'fake-model',
         permissionMode: 'ask',
@@ -255,6 +301,7 @@ describe('HostInteractionCoordinator', () => {
       await mkdir(workspace);
       const session = await stores.sessionStore.create({
         cwd: workspace,
+        llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
         llmConnectionSlug: 'fake',
         model: 'fake-model',
         permissionMode: 'ask',
@@ -326,6 +373,7 @@ describe('HostInteractionCoordinator', () => {
       await mkdir(workspace);
       const session = await stores.sessionStore.create({
         cwd: workspace,
+        llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
         llmConnectionSlug: 'fake',
         model: 'fake-model',
         permissionMode: 'ask',
@@ -501,6 +549,7 @@ describe('HostInteractionCoordinator', () => {
       await mkdir(workspace);
       const session = await stores.sessionStore.create({
         cwd: workspace,
+        llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
         llmConnectionSlug: 'fake',
         model: 'fake-model',
         permissionMode: 'ask',
@@ -836,12 +885,4 @@ async function withStore(run: (context: StoreContext) => Promise<void>): Promise
     await rm(owner.controlDirectory, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
   }
-}
-
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
 }

@@ -29,14 +29,17 @@ import {
 } from '@maka/ui';
 import type {
   SandboxBoundaryRequestEvent,
+  ClientCapabilityRequestEvent,
   QuoteRef,
   SessionEvent,
   UserQuestionRequestEvent,
 } from '@maka/core/events';
 import type { SandboxBoundaryResponse } from '@maka/core/sandbox-boundary';
+import type { ClientCapabilityResponse } from '@maka/core/client-capability-grant';
 import type { PermissionMode } from '@maka/core/permission';
 import type { SessionSummary, StoredMessage } from '@maka/core/session';
 import type { UiLocale } from '@maka/core/ui-locale';
+import type { ChatModelChoice } from '@maka/core/chat-model-choice';
 import type { UserQuestionResponse } from '@maka/core/user-question';
 import { useWorkbarServices } from '../../services-context.js';
 import type { WorkbarIngestInput } from '../../ports.js';
@@ -49,6 +52,7 @@ import {
   deriveCompanionComposerState,
   ensureCompanionFork,
   performCompanionTurn,
+  sessionHasExactModelChoice,
   type CompanionErrorCode,
   type EnsureCompanionForkResult,
 } from './quote-companion-core.js';
@@ -102,6 +106,8 @@ export interface UseQuoteCompanionInput {
    *  branchFromTurn) so it inherits the full conversation context + model / cwd —
    *  Codex `/side` style. */
   sourceSession: SessionSummary | undefined;
+  /** Latest Host-authorized choices used to validate both source and fork. */
+  modelChoices: readonly ChatModelChoice[];
   locale: UiLocale;
   /** Called once a send has consumed the staged quotes, so the host clears them. */
   onQuotesConsumed: (snapshot: CompanionQuoteSnapshot) => void;
@@ -122,6 +128,8 @@ export interface UseQuoteCompanionResult {
   streaming: boolean;
   processing: boolean;
   preparing: boolean;
+  /** Whether the source and any committed companion can execute their exact model. */
+  modelReady: boolean;
   permissionMode: PermissionMode | undefined;
   permissionModePending: boolean;
   regeneratePendingTurnId: string | null;
@@ -131,6 +139,7 @@ export interface UseQuoteCompanionResult {
   activeModel: { llmConnectionSlug: string; model: string } | undefined;
   /** Pending sandbox-boundary / user-question prompt raised by the companion's run. */
   activeSandboxBoundary: SandboxBoundaryRequestEvent | undefined;
+  activeClientCapability: ClientCapabilityRequestEvent | undefined;
   activeQuestion: UserQuestionRequestEvent | undefined;
   /** Returns whether the send was accepted; false leaves the draft + staged
    *  quotes in place so the user can retry. */
@@ -141,6 +150,7 @@ export interface UseQuoteCompanionResult {
   regenerate: (turnId: string) => Promise<boolean>;
   stop: () => Promise<void>;
   respondToSandboxBoundary: (response: SandboxBoundaryResponse) => Promise<void>;
+  respondToClientCapability: (response: ClientCapabilityResponse) => Promise<void>;
   respondToUserQuestion: (response: UserQuestionResponse) => Promise<void>;
 }
 
@@ -171,6 +181,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     panelId,
     locale,
     sourceSession,
+    modelChoices,
     pendingQuotes,
     onQuotesConsumed,
     onForkVisibilityChange,
@@ -184,6 +195,9 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
   const pendingForkIdRef = useRef<string | null>(null);
   const sourceSessionRef = useRef(sourceSession);
   sourceSessionRef.current = sourceSession;
+  const modelChoicesRef = useRef(modelChoices);
+  modelChoicesRef.current = modelChoices;
+  const sourceModelReady = sessionHasExactModelChoice(sourceSession, modelChoices);
   const sourceSessionId = sourceSession?.id;
   const sourceSessionIdRef = useRef(sourceSession?.id);
   sourceSessionIdRef.current = sourceSessionId;
@@ -191,8 +205,10 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
   const stopRequestRef = useRef<Promise<unknown> | null>(null);
   const activeTurnIdRef = useRef<string | null>(null);
   const pendingAdmissionRef = useRef<PendingAdmission | null>(null);
+  const reconcilingAdmissionRef = useRef<PendingAdmission | null>(null);
   const subscriptionReadyRef = useRef<Promise<void>>(Promise.resolve());
   const submitLockRef = useRef(false);
+  const [submitLocked, setSubmitLockedState] = useState(false);
   const settlingTurnIdsRef = useRef<Set<string>>(new Set());
   const onForkVisibilityChangeRef = useRef(onForkVisibilityChange);
   onForkVisibilityChangeRef.current = onForkVisibilityChange;
@@ -219,6 +235,8 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     null,
   );
   const [hasContent, setHasContent] = useState(false);
+  const hasContentRef = useRef(hasContent);
+  hasContentRef.current = hasContent;
   const [error, setError] = useState<string | null>(null);
   const [forkRetryPending, setForkRetryPending] = useState(false);
   // Bumped whenever the own-turn set changes so the render picks up the new
@@ -234,6 +252,10 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
   const setPendingAdmission = useCallback((admission: PendingAdmission | null) => {
     pendingAdmissionRef.current = admission;
     setPendingAdmissionState(admission);
+  }, []);
+  const setSubmitLocked = useCallback((locked: boolean) => {
+    submitLockRef.current = locked;
+    setSubmitLockedState(locked);
   }, []);
 
   const applyOwnedEvent = useCallback(
@@ -293,6 +315,11 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
       const admission = pendingAdmissionRef.current;
       if (!admission) return;
       setPendingAdmission(null);
+      // Host admission is the durable-content boundary. Even if a concurrent
+      // Stop interrupts the Run before send() settles, this fork now owns a
+      // persisted user message and must never be replaced as an empty copy.
+      hasContentRef.current = true;
+      setHasContent(true);
       activeTurnIdRef.current = turnId;
       ownTurnIdsRef.current.add(turnId);
       admission.consumeOnAdmission?.();
@@ -306,6 +333,33 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
       }
     },
     [applyOwnedEvent, setPendingAdmission],
+  );
+
+  // A Message whose admission answer was lost is still reconcilable: the Host
+  // materializes a root Message before its Run starts, so the durable
+  // transcript names the Turn it opened under the identity the panel sent.
+  const reconcileUnknownAdmission = useCallback(
+    async (forkId: string, admission: PendingAdmission): Promise<void> => {
+      if (reconcilingAdmissionRef.current === admission) return;
+      reconcilingAdmissionRef.current = admission;
+      try {
+        const { messages } = await sideChat.readSettledMessages(forkId);
+        if (!mountedRef.current || pendingAdmissionRef.current !== admission) return;
+        const admitted = messages.find(
+          (message) => message.type === 'user' && message.id === admission.messageId,
+        );
+        if (admitted?.turnId) {
+          bindAdmittedTurn(forkId, admitted.turnId, { preserveLiveTurn: true });
+        }
+      } catch {
+        // The next event this fork produces is another chance to reconcile.
+      } finally {
+        if (reconcilingAdmissionRef.current === admission) {
+          reconcilingAdmissionRef.current = null;
+        }
+      }
+    },
+    [bindAdmittedTurn, mountedRef, sideChat],
   );
 
   const releaseAdmission = useCallback(
@@ -398,6 +452,9 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
             applyOwnedEvent(forkId, event);
           } else {
             admission.events.push(event);
+            // This fork is producing Turn events while the panel still holds an
+            // unproven Message: the transcript can say whether they are its own.
+            void reconcileUnknownAdmission(forkId, admission);
           }
           return;
         }
@@ -434,40 +491,103 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
       name: string,
       options: { readonly showPreparing?: boolean } = {},
     ): Promise<EnsureCompanionForkResult> => {
-      const existing = companionRef.current;
-      if (existing) return Promise.resolve({ status: 'ready', session: existing });
       if (forkSetupPromiseRef.current) return forkSetupPromiseRef.current;
       const currentSourceSession = sourceSessionRef.current;
-      if (!currentSourceSession) {
+      if (
+        !currentSourceSession ||
+        !sessionHasExactModelChoice(currentSourceSession, modelChoicesRef.current)
+      ) {
+        return Promise.resolve({ status: 'error', code: 'fork_setup_failed' });
+      }
+      const existing = companionRef.current;
+      if (existing && sessionHasExactModelChoice(existing, modelChoicesRef.current)) {
+        return Promise.resolve({ status: 'ready', session: existing });
+      }
+      // Never discard an accepted side conversation implicitly. An unavailable
+      // empty fork can be recreated from the repaired source; a fork with its
+      // own content stays inspectable until the user closes the panel.
+      if (
+        existing &&
+        (hasContentRef.current ||
+          submitLockRef.current ||
+          pendingAdmissionRef.current !== null ||
+          activeTurnIdRef.current !== null)
+      ) {
         return Promise.resolve({ status: 'error', code: 'fork_setup_failed' });
       }
 
       const showPreparing = options.showPreparing ?? true;
       if (showPreparing) setPreparing(true);
-      const promise = ensureCompanionFork({
-        api: sideChat,
-        sourceSession: currentSourceSession,
-        panelId,
-        name,
-        isDisposed: () => !mountedRef.current,
-        onForkCreated: (session) => {
-          pendingForkIdRef.current = session.id;
-          onForkVisibilityChangeRef.current?.({
-            type: 'fork-created',
-            sessionId: session.id,
-          });
-        },
-        onForkCleanupSucceeded: (sessionId) => {
-          if (pendingForkIdRef.current === sessionId) {
-            pendingForkIdRef.current = null;
-          }
+      const promise = (async (): Promise<EnsureCompanionForkResult> => {
+        if (existing) {
+          const sourceId = sourceSessionIdRef.current;
+          if (!sourceId) return { status: 'error', code: 'fork_setup_failed' };
+          const cleaned = await dismissCompanionCopy(sideChat, sourceId, panelId, existing.id);
+          if (!cleaned) return { status: 'error', code: 'fork_setup_failed' };
+          unsubscribeRef.current?.();
+          unsubscribeRef.current = null;
+          subscriptionReadyRef.current = Promise.resolve();
+          companionIdRef.current = null;
+          companionRef.current = undefined;
+          setCompanion(undefined);
+          setAllMessages([]);
           onForkVisibilityChangeRef.current?.({
             type: 'cleanup-succeeded',
-            sessionId,
+            sessionId: existing.id,
           });
-        },
-      })
-        .then((result) => {
+        }
+
+        const latestSource = sourceSessionRef.current;
+        if (
+          !latestSource ||
+          !sessionHasExactModelChoice(latestSource, modelChoicesRef.current)
+        ) {
+          return { status: 'error', code: 'fork_setup_failed' };
+        }
+        return ensureCompanionFork({
+          api: sideChat,
+          sourceSession: latestSource,
+          panelId,
+          name,
+          isDisposed: () => !mountedRef.current,
+          onForkCreated: (session) => {
+            pendingForkIdRef.current = session.id;
+            onForkVisibilityChangeRef.current?.({
+              type: 'fork-created',
+              sessionId: session.id,
+            });
+          },
+          onForkCleanupSucceeded: (sessionId) => {
+            if (pendingForkIdRef.current === sessionId) {
+              pendingForkIdRef.current = null;
+            }
+            onForkVisibilityChangeRef.current?.({
+              type: 'cleanup-succeeded',
+              sessionId,
+            });
+          },
+        });
+      })()
+        .then(async (result): Promise<EnsureCompanionForkResult> => {
+          if (
+            result.status === 'ready' &&
+            !sessionHasExactModelChoice(result.session, modelChoicesRef.current)
+          ) {
+            const sourceId = sourceSessionIdRef.current;
+            const cleaned = sourceId
+              ? await dismissCompanionCopy(sideChat, sourceId, panelId, result.session.id)
+              : false;
+            if (pendingForkIdRef.current === result.session.id) {
+              pendingForkIdRef.current = null;
+            }
+            if (cleaned) {
+              onForkVisibilityChangeRef.current?.({
+                type: 'cleanup-succeeded',
+                sessionId: result.session.id,
+              });
+            }
+            return { status: 'error', code: 'fork_setup_failed' };
+          }
           if (result.status === 'ready' && mountedRef.current) {
             setForkRetryPending(false);
             setError(null);
@@ -495,9 +615,25 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     [commitFork, mountedRef, panelId, sideChat],
   );
 
+  const companionModelReady =
+    companion === undefined || sessionHasExactModelChoice(companion, modelChoices);
   useEffect(() => {
-    if (sourceSessionId) void ensureFork(copyRef.current.defaultName);
-  }, [ensureFork, sourceSessionId]);
+    if (!sourceSessionId) return;
+    if (!sourceModelReady) {
+      setPreparing(false);
+      return;
+    }
+    void ensureFork(copyRef.current.defaultName);
+  }, [
+    companionModelReady,
+    ensureFork,
+    hasContent,
+    pendingAdmission,
+    sourceModelReady,
+    sourceSessionId,
+    streaming,
+    submitLocked,
+  ]);
 
   useEffect(() => {
     if (!sourceSessionId || !forkRetryPending) return;
@@ -579,14 +715,14 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
         return false;
       }
       // Close the same-frame double-submit window before fork readiness can yield.
-      submitLockRef.current = true;
+      setSubmitLocked(true);
       setError(null);
       const turnId = crypto.randomUUID();
       const quoteSnapshot = snapshotCompanionQuotes(panelId, pendingQuotes);
       const label = (quoteSnapshot.quotes[0]?.text ?? trimmed).slice(0, 24);
       const fork = await ensureFork(`${copyRef.current.namePrefix}${label}`);
       if (fork.status !== 'ready') {
-        submitLockRef.current = false;
+        setSubmitLocked(false);
         return false;
       }
       try {
@@ -597,11 +733,11 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
           subscriptionReadyRef.current = subscribeToFork(fork.session.id);
           setError(copyRef.current.errors.sendFailed);
         }
-        submitLockRef.current = false;
+        setSubmitLocked(false);
         return false;
       }
       if (!mountedRef.current) {
-        submitLockRef.current = false;
+        setSubmitLocked(false);
         return false;
       }
       let sendAdmission: PendingAdmission | undefined;
@@ -633,7 +769,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
           };
           sendAdmission = admission;
           setPendingAdmission(admission);
-          submitLockRef.current = false;
+          setSubmitLocked(false);
           setLiveTurn(armLiveTurn(turnId));
         },
       });
@@ -645,6 +781,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
           if (outcome?.kind === 'retracted') {
             return false;
           }
+          void reconcileUnknownAdmission(result.forkId, admission);
         } else if (result.steered) {
           if (resolveAdmission(result.forkId, admission, result.messageId)?.kind === 'retracted') {
             return false;
@@ -690,7 +827,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
         setLiveTurn(undefined);
       }
       // 'disposed' → the panel unmounted mid-create; nothing to update.
-      submitLockRef.current = false;
+      setSubmitLocked(false);
       return false;
     },
     [
@@ -705,6 +842,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
       releaseAdmission,
       resolveAdmission,
       setPendingAdmission,
+      setSubmitLocked,
     ],
   );
 
@@ -891,6 +1029,19 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     [mountedRef, sideChat],
   );
 
+  const respondToClientCapability = useCallback(
+    async (response: ClientCapabilityResponse): Promise<void> => {
+      const id = companionIdRef.current;
+      if (!mountedRef.current || !id) return;
+      try {
+        await sideChat.respondToClientCapability(id, response);
+      } catch {
+        if (mountedRef.current) setError(copyRef.current.errors.respondFailed);
+      }
+    },
+    [mountedRef, sideChat],
+  );
+
   // Only the companion's own turns render; the forked parent history stays as
   // hidden model context.
   const messages = allMessages.filter(
@@ -909,6 +1060,8 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     : undefined;
   const activeSandboxBoundary =
     activeInteraction?.type === 'sandbox_boundary_request' ? activeInteraction : undefined;
+  const activeClientCapability =
+    activeInteraction?.type === 'client_capability_request' ? activeInteraction : undefined;
   const activeQuestion =
     activeInteraction?.type === 'user_question_request' ? activeInteraction : undefined;
 
@@ -920,12 +1073,14 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     streaming,
     processing,
     preparing,
+    modelReady: sourceModelReady && companionModelReady,
     permissionMode,
     permissionModePending,
     regeneratePendingTurnId,
     error,
     activeModel,
     activeSandboxBoundary,
+    activeClientCapability,
     activeQuestion,
     send,
     steer,
@@ -933,6 +1088,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
     regenerate,
     stop,
     respondToSandboxBoundary,
+    respondToClientCapability,
     respondToUserQuestion,
   };
 }

@@ -24,6 +24,7 @@ import {
   ChatView,
   ChatSurfaceLayout,
   Composer,
+  ClientCapabilityPrompt,
   SandboxBoundaryPrompt,
   UserQuestionPrompt,
   useToast,
@@ -31,10 +32,10 @@ import {
   type ChatModelChoice,
   type ComposerHandle,
 } from '@maka/ui';
-import type { ComposerProps } from '../../../../../../../../packages/ui/dist/composer.d.ts';
 import type { SessionSummary } from '@maka/core/session';
 import { useQuoteCompanion } from './use-quote-companion';
 import { useComposerAttachments } from '../../../../use-composer-attachments';
+import { useComposerMentionsContext } from '../../../../composer-mentions.js';
 import { preflightAttachmentItems } from '../../../../attachment-preflight';
 import { toComposerIngestItems } from '../../../../composer-attachments';
 import { getDesktopConversationCopy } from '../../../../locales/conversation-copy.js';
@@ -67,10 +68,6 @@ export function QuoteCompanionPanel(props: {
   sourceSession: SessionSummary | undefined;
   /** Shared global choice list, only used to render the inherited model's label. */
   modelChoices: readonly ChatModelChoice[];
-  mentionSkills?: ComposerProps['mentionSkills'];
-  mentionSkillsUnavailable?: ComposerProps['mentionSkillsUnavailable'];
-  mentionSkillsLoading?: ComposerProps['mentionSkillsLoading'];
-  onSearchMentionFiles?: ComposerProps['onSearchMentionFiles'];
   onQuotesConsumed: (snapshot: CompanionQuoteSnapshot) => void;
   onRemoveQuote?: (target: CompanionQuoteTarget) => void;
   onForkVisibilityChange?: (event: CompanionForkVisibilityEvent) => void;
@@ -81,6 +78,7 @@ export function QuoteCompanionPanel(props: {
   onActivityStateChange?: (panelId: string, active: boolean) => void;
 }) {
   const { attachments } = useWorkbarServices();
+  const mentions = useComposerMentionsContext();
   const locale = useUiLocale();
   const toast = useToast();
   const copy = getDesktopConversationCopy(locale).quoteCompanion;
@@ -102,6 +100,7 @@ export function QuoteCompanionPanel(props: {
     panelId: props.panelId,
     pendingQuotes: props.quotes,
     sourceSession: props.sourceSession,
+    modelChoices: props.modelChoices,
     locale,
     onQuotesConsumed: props.onQuotesConsumed,
     onForkVisibilityChange: props.onForkVisibilityChange,
@@ -133,6 +132,7 @@ export function QuoteCompanionPanel(props: {
     if (
       !props.active ||
       companion.preparing ||
+      !companion.modelReady ||
       !prompt ||
       initialPromptStartedRef.current
     ) {
@@ -162,6 +162,7 @@ export function QuoteCompanionPanel(props: {
     props.onInitialPromptStarted,
     props.onPromptAccepted,
     props.panelId,
+    companion.modelReady,
   ]);
 
   // The companion inherits the source model and does not switch it; look up a
@@ -176,7 +177,10 @@ export function QuoteCompanionPanel(props: {
         )?.label
       : undefined) ?? activeModel?.model;
 
-  const activeInteraction = companion.activeSandboxBoundary ?? companion.activeQuestion;
+  const activeInteraction =
+    companion.activeSandboxBoundary ??
+    companion.activeClientCapability ??
+    companion.activeQuestion;
   const deriveTurnPresentation = useCallback<
     NonNullable<ComponentProps<typeof ChatView>['deriveTurnPresentation']>
   >(
@@ -195,7 +199,8 @@ export function QuoteCompanionPanel(props: {
         ]),
       ),
       failedReasonLabels: {},
-      failedRecoveryLabels: {},
+      failedSeverities: {},
+      failedExecutionStateLabels: {},
       lineageBadgesByTurn: {},
     }),
     [companion.regeneratePendingTurnId, locale],
@@ -207,19 +212,27 @@ export function QuoteCompanionPanel(props: {
       data-preparing={companion.preparing || undefined}
     >
       <ChatSurfaceLayout
-        conversationKey={companion.companionSession?.id ?? props.sourceSession?.id}
+        scrollOwner="host"
         scrollToBottomLabel={copy.scrollToBottom}
         composer={
           <>
             {companion.error && (
               <Banner status="error" role="alert" title={companion.error} />
             )}
-            {(companion.activeSandboxBoundary || companion.activeQuestion) && (
+            {(companion.activeSandboxBoundary ||
+              companion.activeClientCapability ||
+              companion.activeQuestion) && (
               <div className="maka-composer-interaction-slot">
                 {companion.activeSandboxBoundary && (
                   <SandboxBoundaryPrompt
                     request={companion.activeSandboxBoundary}
                     onRespond={companion.respondToSandboxBoundary}
+                  />
+                )}
+                {companion.activeClientCapability && (
+                  <ClientCapabilityPrompt
+                    request={companion.activeClientCapability}
+                    onRespond={companion.respondToClientCapability}
                   />
                 )}
                 {companion.activeQuestion && (
@@ -263,16 +276,16 @@ export function QuoteCompanionPanel(props: {
               streaming={companion.streaming}
               processing={companion.processing}
               draftKey={draftKey}
-              disabled={!props.sourceSession || companion.preparing}
+              disabled={!companion.modelReady || companion.preparing}
               onPickAttachments={pickAttachments}
               onAttachFilePaths={attachFilePaths}
               pendingAttachments={pendingAttachments}
               onRemoveAttachment={removeAttachment}
-              mentionSkills={props.mentionSkills}
-              onSearchMentionFiles={props.onSearchMentionFiles}
+              mentionSkills={mentions?.mentionSkills}
+              onSearchMentionFiles={mentions?.searchMentionFiles}
               pendingQuotes={props.quotes.map((quote) => quote.value)}
-              mentionSkillsUnavailable={props.mentionSkillsUnavailable}
-              mentionSkillsLoading={props.mentionSkillsLoading}
+              mentionSkillsUnavailable={mentions?.mentionSkillsUnavailable}
+              mentionSkillsLoading={mentions?.mentionSkillsLoading}
               contextDrawerDefaultCollapsed
               showStaticModelUnavailableStatus={false}
               onRemoveQuote={(index) => {
@@ -305,6 +318,7 @@ export function QuoteCompanionPanel(props: {
           liveTurn={companion.liveTurn}
           runningStatus={companion.processing}
           activeSession={companion.companionSession}
+          onReadAttachmentBytes={attachments.readBytes}
           deriveTurnPresentation={deriveTurnPresentation}
           onTurnFooterAction={(turnId, actionId) => {
             if (actionId === 'regenerate') {

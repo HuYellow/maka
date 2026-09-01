@@ -22,12 +22,11 @@ import type { ModelCallCommit } from '@maka/core/agent-run';
  * Tests for buildLlmHistorySummarizer — the AI-SDK-backed LLM summary that
  * replaces the deterministic excerpt draft when wiring injects it.
  *
- * Run: `npm --workspace @maka/runtime run test`
+ * Run: `npm run build && npm --workspace @maka/runtime run test:dist`
  */
 import { MockLanguageModelV4 } from 'ai/test';
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { expect } from '../test-helpers.js';
 import type { RuntimeEvent, RuntimeEventContent } from '@maka/core/runtime-event';
 import { decodeModelCallAttempt, type ModelCallAttempt } from '@maka/core/model-call-attempt';
 import { ProviderRequestTracker } from '../provider-request-telemetry.js';
@@ -99,8 +98,8 @@ describe('buildLlmHistorySummarizer', () => {
       inputBudget: { maxEstimatedTokens: 10_000, charsPerToken: 1 },
     });
 
-    expect(seen?.providerOptions).toBe(providerOptions);
-    expect(seen?.maxOutputTokens).toBe(undefined);
+    assert.strictEqual(seen?.providerOptions, providerOptions);
+    assert.strictEqual(seen?.maxOutputTokens, undefined);
   });
 
   test('attributes provider-reported usage to one canonical history-compaction record', async () => {
@@ -135,8 +134,7 @@ describe('buildLlmHistorySummarizer', () => {
           return now;
         },
         newId: () => 'trace-id',
-        persistCapture: async () => ({ artifactId: 'artifact-1' }),
-        recordAttempt: () => {},
+        persistArtifact: async () => ({ artifactId: 'artifact-1' }),
         accounting: {
           sessionId: 'sess-1',
           resolveRunId: () => 'run-1',
@@ -166,6 +164,66 @@ describe('buildLlmHistorySummarizer', () => {
     assert.equal(attempt.costUsd, undefined);
   });
 
+  test('attributes a malformed completion and its repair to separate logical steps', async () => {
+    const recorded: ModelCallAttempt[] = [];
+    let providerCalls = 0;
+    let id = 0;
+    const summarize = buildLlmHistorySummarizer({
+      resolveModel: () =>
+        new MockLanguageModelV4({
+          doGenerate: async () => {
+            providerCalls += 1;
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: providerCalls === 1 ? 'free-form incomplete summary' : VALID_SUMMARY,
+                },
+              ],
+              finishReason: { unified: 'stop' as const, raw: 'stop' },
+              usage: {
+                inputTokens: { total: 7, noCache: 7, cacheRead: 0, cacheWrite: 0 },
+                outputTokens: { total: 3, text: 3, reasoning: 0 },
+              },
+              warnings: [],
+            };
+          },
+        }),
+    });
+
+    await summarize({
+      ...inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
+      providerRequestTracker: new ProviderRequestTracker({
+        traceId: 'trace-id',
+        turnId: 'turn-1',
+        now: () => 100 + id,
+        newId: () => `request-${++id}`,
+        persistArtifact: async () => ({ artifactId: `artifact-${id}` }),
+        accounting: {
+          sessionId: 'sess-1',
+          resolveRunId: () => 'run-1',
+          connectionSlug: 'connection',
+          providerId: 'provider',
+          callKind: 'history_compact',
+          record: ({ attempt }: ModelCallCommit<ModelCallAttempt>) => {
+            recorded.push(attempt);
+          },
+        },
+      }),
+    });
+
+    assert.equal(providerCalls, 2);
+    assert.deepEqual(
+      recorded.map((attempt) => attempt.step),
+      [0, 1],
+    );
+    assert.deepEqual(
+      recorded.map((attempt) => attempt.attempt),
+      [0, 0],
+    );
+    assert.notEqual(recorded[0]?.logicalCallId, recorded[1]?.logicalCallId);
+  });
+
   test('produces schema-valid tool-result messages (toolName + wrapped output) and does not fall back', async () => {
     const seen: Array<{ messages: unknown[] }> = [];
     const generateText: AiSdkGenerateTextLike = async (opts) => {
@@ -190,18 +248,18 @@ describe('buildLlmHistorySummarizer', () => {
     ];
 
     const result = await summarize(inputWith(events));
-    expect(result).toBe(VALID_SUMMARY);
+    assert.strictEqual(result, VALID_SUMMARY);
 
     const messages = seen[0]!.messages as Array<{
       role: string;
       content: Array<{ type: string; toolName?: string; output?: unknown }>;
     }>;
     const toolPart = messages.find((m) => m.role === 'tool')!.content[0]!;
-    expect(toolPart.type).toBe('tool-result');
+    assert.strictEqual(toolPart.type, 'tool-result');
     // toolName must be present in AI SDK tool-result content.
-    expect(toolPart.toolName).toBe('read');
+    assert.strictEqual(toolPart.toolName, 'read');
     // output must be the {type, value} wrapper, not the raw result object
-    expect(toolPart.output).toEqual({ type: 'json', value: { name: 'maka' } });
+    assert.deepStrictEqual(toolPart.output, { type: 'json', value: { name: 'maka' } });
   });
 
   test('groups parallel tool calls into one assistant message for strict providers', async () => {
@@ -644,6 +702,120 @@ describe('buildLlmHistorySummarizer', () => {
     );
   });
 
+  test('repairs one malformed completion with a single stricter retry', async () => {
+    const instructions: string[] = [];
+    const summarize = buildLlmHistorySummarizer({
+      resolveModel: () => 'fake-model',
+      generateText: async (options) => {
+        instructions.push(options.instructions);
+        return {
+          text: instructions.length === 1 ? 'free-form incomplete summary' : VALID_SUMMARY,
+          finishReason: 'stop',
+        };
+      },
+    });
+
+    const result = await summarize(
+      inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
+    );
+
+    assert.equal(result, VALID_SUMMARY);
+    assert.equal(instructions.length, 2);
+    assert.match(instructions[1] ?? '', /malformed_summary_missing_section/);
+  });
+
+  test('bounds a persistently malformed completion at two provider calls', async () => {
+    let calls = 0;
+    const summarize = buildLlmHistorySummarizer({
+      resolveModel: () => 'fake-model',
+      generateText: async () => {
+        calls += 1;
+        return { text: 'free-form incomplete summary', finishReason: 'stop' };
+      },
+    });
+
+    await assert.rejects(
+      summarize(
+        inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
+      ),
+      (error) =>
+        error instanceof HistoryCompactSummarizerError &&
+        error.reason === 'malformed_summary_missing_section',
+    );
+    assert.equal(calls, 2);
+  });
+
+  test('preserves the initial malformed defect when the repair request fails', async () => {
+    let calls = 0;
+    const summarize = buildLlmHistorySummarizer({
+      resolveModel: () => 'fake-model',
+      generateText: async () => {
+        calls += 1;
+        if (calls === 1) return { text: 'free-form incomplete summary', finishReason: 'stop' };
+        throw new Error('model down during repair');
+      },
+    });
+
+    await assert.rejects(
+      summarize(
+        inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
+      ),
+      (error) =>
+        error instanceof HistoryCompactSummarizerError &&
+        error.reason === 'malformed_summary_missing_section' &&
+        error.cause instanceof HistoryCompactSummarizerError &&
+        error.cause.reason === 'provider_error' &&
+        error.cause.cause instanceof Error &&
+        error.cause.cause.message === 'model down during repair',
+    );
+    assert.equal(calls, 2);
+  });
+
+  test('preserves cancellation when a malformed-summary repair is aborted', async () => {
+    let calls = 0;
+    const abortError = Object.assign(new Error('stopped during repair'), { name: 'AbortError' });
+    const summarize = buildLlmHistorySummarizer({
+      resolveModel: () => 'fake-model',
+      generateText: async () => {
+        calls += 1;
+        if (calls === 1) return { text: 'free-form incomplete summary', finishReason: 'stop' };
+        throw abortError;
+      },
+    });
+
+    await assert.rejects(
+      summarize(
+        inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
+      ),
+      (error) => error === abortError,
+    );
+    assert.equal(calls, 2);
+  });
+
+  test('preserves the initial malformed defect when the repair is empty', async () => {
+    let calls = 0;
+    const summarize = buildLlmHistorySummarizer({
+      resolveModel: () => 'fake-model',
+      generateText: async () => {
+        calls += 1;
+        return {
+          text: calls === 1 ? 'free-form incomplete summary' : '',
+          finishReason: 'stop',
+        };
+      },
+    });
+
+    await assert.rejects(
+      summarize(
+        inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
+      ),
+      (error) =>
+        error instanceof HistoryCompactSummarizerError &&
+        error.reason === 'malformed_summary_missing_section',
+    );
+    assert.equal(calls, 2);
+  });
+
   test('a deeper heading level cannot stand in for a mandated section', async () => {
     const summarize = buildLlmHistorySummarizer({
       resolveModel: () => 'fake-model',
@@ -828,7 +1000,7 @@ describe('buildLlmHistorySummarizer', () => {
     const result = await summarize(
       inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
     );
-    expect(result).toBe(threeSpaceCloser);
+    assert.strictEqual(result, threeSpaceCloser);
   });
 
   test('a longer same-family run still closes a narrower fence', async () => {
@@ -841,7 +1013,7 @@ describe('buildLlmHistorySummarizer', () => {
     const result = await summarize(
       inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
     );
-    expect(result).toBe(closedByLonger);
+    assert.strictEqual(result, closedByLonger);
   });
 
   test('indented and bare heading markers are headings, not section content', async () => {
@@ -884,7 +1056,7 @@ describe('buildLlmHistorySummarizer', () => {
     const result = await summarize(
       inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
     );
-    expect(result).toBe(indented);
+    assert.strictEqual(result, indented);
   });
 
   test('rejects a heading-only skeleton with no section content', async () => {
@@ -943,7 +1115,7 @@ describe('buildLlmHistorySummarizer', () => {
     const result = await summarize(
       inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
     );
-    expect(result).toBe(crlf);
+    assert.strictEqual(result, crlf);
   });
 
   test('CRLF horizontal rules are still separators, not section content', async () => {
@@ -1048,7 +1220,7 @@ describe('buildLlmHistorySummarizer', () => {
     const result = await summarize(
       inputWith([ev({ role: 'user', author: 'user', content: { kind: 'text', text: 'hi' } })]),
     );
-    expect(result).toBe(withInlineFence);
+    assert.strictEqual(result, withInlineFence);
   });
 
   test('rejects a paragraph-sized summary for a large folded span', async () => {
@@ -1128,7 +1300,7 @@ describe('buildLlmHistorySummarizer', () => {
         }),
       ]),
     );
-    expect(result).toBe(exactFloor);
+    assert.strictEqual(result, exactFloor);
   });
 
   test('accepts a proportionate structured summary for a large folded span', async () => {
@@ -1159,7 +1331,7 @@ describe('buildLlmHistorySummarizer', () => {
         }),
       ]),
     );
-    expect(result).toBe(longSummary);
+    assert.strictEqual(result, longSummary);
   });
 
   test('returns undefined without calling generateText when there are no events to summarize', async () => {
@@ -1172,8 +1344,8 @@ describe('buildLlmHistorySummarizer', () => {
 
     const result = await summarize(inputWith([]));
 
-    expect(result).toBe(undefined);
-    expect(called).toBe(false);
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(called, false);
   });
 
   test('rolling summary sends the prior summary plus only newly folded events', async () => {
@@ -1210,11 +1382,11 @@ describe('buildLlmHistorySummarizer', () => {
       inputBudget: { maxEstimatedTokens: 10_000, charsPerToken: 1 },
     });
 
-    expect(result).toBe(VALID_SUMMARY);
+    assert.strictEqual(result, VALID_SUMMARY);
     const serialized = JSON.stringify(seen[0]);
-    expect(serialized).toContain('PRIOR_SUMMARY');
-    expect(serialized).toContain('NEWLY_EVICTED_RAW');
-    expect(serialized.includes('ALREADY_SUMMARIZED_RAW')).toBe(false);
+    assert.ok(serialized.includes('PRIOR_SUMMARY'));
+    assert.ok(serialized.includes('NEWLY_EVICTED_RAW'));
+    assert.strictEqual(serialized.includes('ALREADY_SUMMARIZED_RAW'), false);
   });
 
   test('recompresses the full source when the previous checkpoint is provider-native', async () => {
@@ -1241,7 +1413,7 @@ describe('buildLlmHistorySummarizer', () => {
       coveredRuntimeEvents: [old],
       providerState: {
         kind: 'openai_codex_remote_v2',
-        connectionSlug: 'codex-subscription',
+        connectionId: 'connection-codex',
         modelId: 'gpt-5.3-codex',
         itemId: 'cmp_123',
         encryptedContent: 'opaque-state',
@@ -1255,8 +1427,8 @@ describe('buildLlmHistorySummarizer', () => {
     });
 
     const serialized = JSON.stringify(seen);
-    expect(serialized).toContain('OLD_PROVIDER_ONLY_FACT');
-    expect(serialized).toContain('NEW_PORTABLE_FACT');
-    expect(serialized.includes('opaque-state')).toBe(false);
+    assert.ok(serialized.includes('OLD_PROVIDER_ONLY_FACT'));
+    assert.ok(serialized.includes('NEW_PORTABLE_FACT'));
+    assert.strictEqual(serialized.includes('opaque-state'), false);
   });
 });

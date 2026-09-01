@@ -268,6 +268,30 @@ type ShellCopy = {
     deletedTitle(name: string): string;
     /** The task was restored elsewhere, so the delete was called off. */
     deleteRestoredTitle(name: string): string;
+    /** Appended to the delete confirm when the task has linked subagent subtasks. */
+    deleteSubtaskNote(): string;
+    /** Appended to the delete confirm when the subtask preview could not be read. */
+    deleteSubtaskNoteUncertain(): string;
+    /** Toast description after deleting a task that had linked subagent subtasks. */
+    deletedSubtaskNote(count: number): string;
+    bulkDeleteTitle(count: number): string;
+    bulkDeleteDescription: string;
+    bulkArchiveTitle(count: number): string;
+    bulkArchiveDescription: string;
+    bulkArchiveLabel: string;
+    bulkDeletedTitle(count: number): string;
+    bulkArchivedTitle(count: number): string;
+    /** Tasks restored while the sweep was reaching them, so they were kept. */
+    bulkKeptRestored(count: number): string;
+    bulkDeleteFailedTitle: string;
+    bulkArchiveFailedTitle: string;
+    bulkFailedBody(count: number): string;
+    /** The catalog could not be read back, so nothing can be claimed. */
+    bulkUnverified: string;
+    /** Appended to the bulk delete confirm when the selection has linked subtasks. */
+    bulkDeleteSubtaskNote(): string;
+    /** Appended when the subtask preview could not be read for the whole selection. */
+    bulkDeleteSubtaskNoteUncertain(): string;
   };
   skillActions: {
     refreshSkillsFailedTitle: string;
@@ -337,6 +361,7 @@ type ShellCopy = {
     modelSwitchedDescription(from: string, to: string): string;
     modelFailedTitle: string;
     modelFallback: string;
+    modelRecoveryHint: string;
     thinkingUpdatedTitle: string;
     thinkingDefault: string;
     thinkingLabels: Record<ThinkingLevel, string>;
@@ -892,6 +917,24 @@ const SHELL_COPY_BY_LOCALE = {
       cancelLabel: '取消',
       deletedTitle: (name: string) => `已删除 ${name}`,
       deleteRestoredTitle: (name: string) => `${name} 已被恢复，未删除`,
+      deleteSubtaskNote: () => '其普通子任务不会被删除，将保留并移入归档。',
+      deleteSubtaskNoteUncertain: () => '其普通子任务（如有）不会被删除，将保留并移入归档。',
+      deletedSubtaskNote: (count: number) => `${count} 个子任务已移入归档`,
+      bulkDeleteTitle: (count: number) => `删除选中的 ${count} 个任务？`,
+      bulkDeleteDescription: '删除后无法恢复，任务的全部修订版本都会一并删除。',
+      bulkArchiveTitle: (count: number) => `归档选中的 ${count} 个任务？`,
+      bulkArchiveDescription: '归档后可在「设置 › 活动 › 已归档任务」中找回。',
+      bulkArchiveLabel: '归档',
+      bulkDeletedTitle: (count: number) => `已删除 ${count} 个任务`,
+      bulkArchivedTitle: (count: number) => `已归档 ${count} 个任务`,
+      bulkKeptRestored: (count: number) => `另有 ${count} 个已被恢复，未删除。`,
+      bulkDeleteFailedTitle: '部分任务未能删除',
+      bulkArchiveFailedTitle: '部分任务未能归档',
+      bulkFailedBody: (count: number) => `还有 ${count} 个没有处理成功。`,
+      bulkUnverified: '无法确认处理结果，请刷新后查看。',
+      bulkDeleteSubtaskNote: () => '它们的普通子任务不会被删除，将保留并移入归档。',
+      bulkDeleteSubtaskNoteUncertain: () =>
+        '它们的普通子任务（如有）不会被删除，将保留并移入归档。',
     },
     skillActions: {
       refreshSkillsFailedTitle: '刷新技能失败',
@@ -1001,6 +1044,7 @@ const SHELL_COPY_BY_LOCALE = {
       modelSwitchedDescription: (from, to) => `${from} → ${to}`,
       modelFailedTitle: '切换模型失败',
       modelFallback: '模型暂时无法切换，请稍后重试。',
+      modelRecoveryHint: '如果所选连接需要登录或 API Key，请到 设置 · 模型 补齐后重试。',
       thinkingUpdatedTitle: '已更新思考级别',
       thinkingDefault: '默认',
       thinkingLabels: {
@@ -1200,10 +1244,10 @@ const SHELL_COPY_BY_LOCALE = {
       sideChatContextPendingTitle: '先处理待发送的上下文',
       sideChatContextPendingDescription:
         '当前 Composer 还有附件、引用或文件 mention。请先发送或移除它们，再使用 /side。',
-      resumeStartedTitle: '已开始安全恢复',
+      resumeStartedTitle: '已开始继续这一轮',
       resumeStartedDescription: '正在从最后一个完整执行边界继续',
-      resumeFailedTitle: '恢复失败',
-      resumeFailedFallback: '无法启动安全恢复，请检查任务状态后重试。',
+      resumeFailedTitle: '继续失败',
+      resumeFailedFallback: '无法继续这一轮，请检查任务状态后重试。',
       goalClearFailedTitle: '停止目标失败',
       goalClearFailedFallback: '目标仍可能继续运行，请立即重试。',
       goalPauseFailedTitle: '暂停目标失败',
@@ -1417,6 +1461,27 @@ const SHELL_COPY_BY_LOCALE = {
       cancelLabel: 'Cancel',
       deletedTitle: (name: string) => `Deleted ${name}`,
       deleteRestoredTitle: (name: string) => `${name} was restored, so it was kept`,
+      deleteSubtaskNote: () => 'Its ordinary subtasks will be kept and moved to Archived.',
+      deleteSubtaskNoteUncertain: () =>
+        'Its ordinary subtasks, if any, will be kept and moved to Archived.',
+      deletedSubtaskNote: (count: number) =>
+        count === 1 ? '1 subtask moved to Archived' : `${count} subtasks moved to Archived`,
+      bulkDeleteTitle: (count: number) => `Delete ${count} selected tasks?`,
+      bulkDeleteDescription:
+        'This cannot be undone, and every revision of each task goes with it.',
+      bulkArchiveTitle: (count: number) => `Archive ${count} selected tasks?`,
+      bulkArchiveDescription: 'Archived tasks stay available under Settings › Activity.',
+      bulkArchiveLabel: 'Archive',
+      bulkDeletedTitle: (count: number) => `Deleted ${count} tasks`,
+      bulkArchivedTitle: (count: number) => `Archived ${count} tasks`,
+      bulkKeptRestored: (count: number) => `${count} were restored meanwhile and kept.`,
+      bulkDeleteFailedTitle: 'Some tasks were not deleted',
+      bulkArchiveFailedTitle: 'Some tasks were not archived',
+      bulkFailedBody: (count: number) => `${count} of them did not go through.`,
+      bulkUnverified: 'The outcome could not be confirmed. Refresh to see what remains.',
+      bulkDeleteSubtaskNote: () => 'Their ordinary subtasks will be kept and moved to Archived.',
+      bulkDeleteSubtaskNoteUncertain: () =>
+        'Any ordinary subtasks they have will be kept and moved to Archived.',
     },
     skillActions: {
       refreshSkillsFailedTitle: 'Could not refresh Skills',
@@ -1527,6 +1592,7 @@ const SHELL_COPY_BY_LOCALE = {
       modelSwitchedDescription: (from, to) => `${from} → ${to}`,
       modelFailedTitle: 'Could not change model',
       modelFallback: 'The model could not be changed. Try again later.',
+      modelRecoveryHint: 'If the selected connection needs sign-in or an API key, complete it in Settings · Models and try again.',
       thinkingUpdatedTitle: 'Thinking level updated',
       thinkingDefault: 'Default',
       thinkingLabels: {
@@ -1766,10 +1832,10 @@ const SHELL_COPY_BY_LOCALE = {
       sideChatContextPendingTitle: 'Resolve pending context first',
       sideChatContextPendingDescription:
         'The Composer still has attachments, quotes, or file mentions. Send or remove them before using /side.',
-      resumeStartedTitle: 'Safe recovery started',
+      resumeStartedTitle: 'Continuing this turn',
       resumeStartedDescription: 'Continuing from the last complete execution boundary',
-      resumeFailedTitle: 'Recovery failed',
-      resumeFailedFallback: 'Safe recovery could not start. Check the task state and try again.',
+      resumeFailedTitle: 'Could not continue',
+      resumeFailedFallback: 'This turn could not be continued. Check the task state and try again.',
       goalClearFailedTitle: 'Could not stop the goal',
       goalClearFailedFallback: 'The goal may still be running. Try again now.',
       goalPauseFailedTitle: 'Could not pause the goal',
