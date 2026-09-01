@@ -42,7 +42,12 @@ const execFileAsync = promisify(execFile);
 export const WINDOWS_SANDBOX_PHASE4_MATRIX = Object.freeze([
   {
     category: 'filesystem_aliases',
-    evidence: ['junction admission', 'multi-hard-link admission', 'outside-root read denial'],
+    evidence: [
+      'nested and root junction admission',
+      'multi-hard-link admission',
+      'bounded root-only Glob admission',
+      'outside-root read denial',
+    ],
   },
   {
     category: 'network_channels',
@@ -307,6 +312,30 @@ export async function verifyWindowsSandboxWorkerE2E(appDirectoryPath) {
         ),
       'Sandboxed broad glob returned a nested junction or one of its descendants.',
     );
+    const rootOnlyGlob = await execute({
+      kind: 'glob',
+      path: projectDirectory,
+      pattern: 'root.ts',
+      limit: 1,
+    });
+    assertCondition(
+      rootOnlyGlob.kind === 'glob' && JSON.stringify(rootOnlyGlob.files) === '["root.ts"]',
+      'Sandboxed root-only glob did not use bounded directory admission.',
+    );
+
+    const rootJunction = join(workspace, 'root-junction');
+    await symlink(projectDirectory, rootJunction, 'junction');
+    let rootJunctionDenied = false;
+    try {
+      await execute({ kind: 'glob', path: rootJunction, pattern: '**/*.ts' });
+    } catch (error) {
+      rootJunctionDenied =
+        error instanceof FilesystemWorkerClientError &&
+        error.reason === 'spawn_failed' &&
+        /nonFollowingReadRootSource.*reparse point/iu.test(error.message);
+    }
+    assertCondition(rootJunctionDenied, 'Sandboxed glob admitted a root junction.');
+
     // The sandbox preview does not expose Grep (no in-process substitute
     // preserves the ripgrep contract); the worker must fail closed.
     let grepUnavailable = false;

@@ -52,6 +52,7 @@ import {
   type FilesystemWorkerResult,
   type FilesystemWorkerTarget,
 } from './protocol.js';
+import { windowsGlobTraversalDepth } from './windows-glob-pattern.js';
 
 export const FILESYSTEM_WORKER_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 
@@ -236,22 +237,24 @@ export class FilesystemWorkerClient {
     // The wire identity contract is derived below from the caller's explicit
     // expectedIdentity; the normalised target itself has no identity field,
     // so the declared type omits it.
-    const target: Omit<FilesystemWorkerTarget, 'identity'> & { writableAncestor?: string } =
-      await (entryMode
-        ? normalizeDirectoryEntryTarget({
-            path: parsedOperation.data.path,
-            access,
-            cwd: canonicalCwd,
-          })
-        : normalizeSandboxBoundaryPath({
-            path: parsedOperation.data.path,
-            access,
-            scope: operationScope(parsedOperation.data.kind),
-            cwd: canonicalCwd,
-          })
-      ).catch(() => {
-        throw clientError('invalid_operation', 'validation', requestId);
-      });
+    const target: Omit<FilesystemWorkerTarget, 'identity'> & {
+      writableAncestor?: string;
+      displayPath?: string;
+    } = await (entryMode
+      ? normalizeDirectoryEntryTarget({
+          path: parsedOperation.data.path,
+          access,
+          cwd: canonicalCwd,
+        })
+      : normalizeSandboxBoundaryPath({
+          path: parsedOperation.data.path,
+          access,
+          scope: operationScope(parsedOperation.data.kind),
+          cwd: canonicalCwd,
+        })
+    ).catch(() => {
+      throw clientError('invalid_operation', 'validation', requestId);
+    });
     // The identity was captured by the caller at lock acquisition (T0) and
     // passed in as expectedIdentity. Do NOT re-derive it here: re-deriving at
     // this point (after the lock is held) would sample the post-queue inode,
@@ -381,7 +384,23 @@ export class FilesystemWorkerClient {
       operation.kind === 'glob' &&
       target.scope === 'subtree' &&
       target.targetType === 'directory'
-        ? target.enforcementPath
+        ? (() => {
+            const sourcePath = target.displayPath;
+            if (!sourcePath) {
+              throw clientError(
+                'invalid_operation',
+                'validation',
+                requestId,
+                'Windows Glob requires an un-followed source root.',
+              );
+            }
+            const maxDepth = windowsGlobTraversalDepth(operation.pattern);
+            return {
+              enforcementPath: target.enforcementPath,
+              sourcePath,
+              ...(maxDepth !== undefined ? { maxDepth } : {}),
+            };
+          })()
         : undefined;
     const pinnedTarget =
       platform === 'linux' && !entryMode && target.targetType !== 'missing'

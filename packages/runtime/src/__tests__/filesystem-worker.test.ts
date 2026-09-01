@@ -18,6 +18,7 @@
  */
 
 import { strict as assert } from 'node:assert';
+import type { Dirent } from 'node:fs';
 import {
   glob as nodeGlob,
   lstat,
@@ -294,6 +295,80 @@ describe('filesystem worker operations', () => {
     assert.deepEqual(await runGlob('{node_modules/@sunrioa/brace{a,b}/**,src/**/*.ts}'), [
       'src/main [1].ts',
     ]);
+  });
+
+  test('prunes a directory replaced by a junction after its parent Dirent was cached', async () => {
+    const root = await temporaryDirectory('maka-worker-glob-replacement-');
+    const outside = await temporaryDirectory('maka-worker-glob-replacement-outside-');
+    const child = join(root, 'queued-child');
+    await mkdir(child);
+    await writeFile(join(child, 'safe.ts'), 'safe', 'utf8');
+    await writeFile(join(outside, 'secret.ts'), 'secret', 'utf8');
+    const visitedDirectories: string[] = [];
+    let replaced = false;
+
+    const response = await executeFilesystemWorkerRequest(
+      await requestFor(
+        { kind: 'glob', cwd: root, path: root, pattern: '**/*.ts' },
+        {
+          enforcementPath: root,
+          access: 'read',
+          scope: 'subtree',
+          targetType: 'directory',
+        },
+      ),
+      {
+        windowsSandboxed: true,
+        windowsGlobReadDirectory: async (path) => {
+          visitedDirectories.push(path);
+          const entries = await readdir(path, { withFileTypes: true });
+          if (path === root && !replaced) {
+            replaced = true;
+            await rm(child, { recursive: true });
+            await symlink(outside, child, process.platform === 'win32' ? 'junction' : 'dir');
+          }
+          return entries;
+        },
+      },
+    );
+
+    assert.equal(response.ok, true);
+    if (response.ok) assert.deepEqual(response.result, { kind: 'glob', files: [] });
+    assert.equal(replaced, true);
+    assert.equal(visitedDirectories.includes(child), false);
+  });
+
+  test('returns a bounded root-only match beside more than 100k ordinary entries', async () => {
+    const root = await temporaryDirectory('maka-worker-glob-large-root-');
+    const entries = Array.from({ length: 100_001 }, (_, index) =>
+      fakeWindowsDirent(`peer-${index}.txt`),
+    );
+    entries.push(fakeWindowsDirent('nested-junction', true), fakeWindowsDirent('main.go'));
+    const visitedDirectories: string[] = [];
+
+    const response = await executeFilesystemWorkerRequest(
+      await requestFor(
+        { kind: 'glob', cwd: root, path: root, pattern: 'main.go', limit: 1 },
+        {
+          enforcementPath: root,
+          access: 'read',
+          scope: 'subtree',
+          targetType: 'directory',
+        },
+      ),
+      {
+        windowsSandboxed: true,
+        windowsGlobReadDirectory: async (path) => {
+          visitedDirectories.push(path);
+          if (path !== root) throw new Error(`unexpected directory read: ${path}`);
+          return entries;
+        },
+      },
+    );
+
+    assert.equal(response.ok, true);
+    if (response.ok) assert.deepEqual(response.result, { kind: 'glob', files: ['main.go'] });
+    assert.deepEqual(visitedDirectories, [root]);
   });
 
   test('preserves Windows Glob matching semantics in the non-following walker', async () => {
@@ -840,6 +915,14 @@ describe('filesystem worker operations', () => {
     assert.equal(response.result.diff, undefined);
   });
 });
+
+function fakeWindowsDirent(name: string, symbolicLink = false): Dirent {
+  return {
+    name,
+    isDirectory: () => false,
+    isSymbolicLink: () => symbolicLink,
+  } as unknown as Dirent;
+}
 
 async function requestFor(
   operation: FilesystemWorkerOperation,

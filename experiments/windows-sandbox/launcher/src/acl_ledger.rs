@@ -41,9 +41,10 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
@@ -410,6 +411,15 @@ pub(crate) fn collect_roots(request: &LaunchRequest) -> Result<Vec<LedgerRoot>, 
         if !request.write_roots.is_empty() || !request.exact_write_roots.is_empty() {
             return Err("nonFollowingReadRoot requires a read-only launch".to_owned());
         }
+        let source = request
+            .non_following_read_root_source
+            .as_deref()
+            .ok_or_else(|| "nonFollowingReadRoot requires nonFollowingReadRootSource".to_owned())?;
+        validate_non_following_read_root_source(Path::new(source), Path::new(non_following_root))?;
+    } else if request.non_following_read_root_source.is_some() {
+        return Err("nonFollowingReadRootSource requires nonFollowingReadRoot".to_owned());
+    } else if request.non_following_read_root_max_depth.is_some() {
+        return Err("nonFollowingReadRootMaxDepth requires nonFollowingReadRoot".to_owned());
     }
     for path in request.read_roots.iter().chain(&request.write_roots) {
         if request
@@ -417,7 +427,12 @@ pub(crate) fn collect_roots(request: &LaunchRequest) -> Result<Vec<LedgerRoot>, 
             .as_deref()
             .is_some_and(|root| root.eq_ignore_ascii_case(path))
         {
-            let partitioned = partition_non_following_read_root(Path::new(path))?;
+            let partitioned = partition_non_following_read_root(
+                Path::new(path),
+                request
+                    .non_following_read_root_max_depth
+                    .map(|depth| depth as usize),
+            )?;
             for root in partitioned {
                 upsert_ledger_root(&mut roots, root);
             }
@@ -495,12 +510,12 @@ struct DirectoryReadPlan {
     roots: Vec<LedgerRoot>,
 }
 
-struct NonFollowingScanBudget {
+struct NonFollowingDirectoryBudget {
     remaining: usize,
     limit: usize,
 }
 
-impl NonFollowingScanBudget {
+impl NonFollowingDirectoryBudget {
     fn new(limit: usize) -> Self {
         Self {
             remaining: limit,
@@ -511,7 +526,7 @@ impl NonFollowingScanBudget {
     fn consume(&mut self) -> Result<(), String> {
         if self.remaining == 0 {
             return Err(format!(
-                "nonFollowingReadRoot exceeds the safe scan limit of {} filesystem entries",
+                "nonFollowingReadRoot exceeds the safe directory scan limit of {} entries",
                 self.limit
             ));
         }
@@ -524,19 +539,29 @@ impl NonFollowingScanBudget {
 /// non-following operation enumerate ordinary entries without granting or
 /// traversing nested Windows reparse points. The root itself remains strict:
 /// a reparse root is rejected instead of silently changing its meaning.
-fn partition_non_following_read_root(path: &Path) -> Result<Vec<LedgerRoot>, String> {
-    partition_non_following_read_root_with_limit(path, MAX_NON_FOLLOWING_READ_GRANTS)
+fn partition_non_following_read_root(
+    path: &Path,
+    traversal_depth: Option<usize>,
+) -> Result<Vec<LedgerRoot>, String> {
+    partition_non_following_read_root_with_options(
+        path,
+        MAX_NON_FOLLOWING_READ_GRANTS,
+        MAX_NON_FOLLOWING_READ_ENTRIES,
+        MAX_NON_FOLLOWING_READ_DEPTH,
+        traversal_depth,
+    )
 }
 
 pub(crate) fn partition_non_following_read_root_with_limit(
     path: &Path,
     max_grants: usize,
 ) -> Result<Vec<LedgerRoot>, String> {
-    partition_non_following_read_root_with_limits(
+    partition_non_following_read_root_with_options(
         path,
         max_grants,
         MAX_NON_FOLLOWING_READ_ENTRIES,
         MAX_NON_FOLLOWING_READ_DEPTH,
+        None,
     )
 }
 
@@ -545,6 +570,16 @@ pub(crate) fn partition_non_following_read_root_with_limits(
     max_grants: usize,
     max_entries: usize,
     max_depth: usize,
+) -> Result<Vec<LedgerRoot>, String> {
+    partition_non_following_read_root_with_options(path, max_grants, max_entries, max_depth, None)
+}
+
+pub(crate) fn partition_non_following_read_root_with_options(
+    path: &Path,
+    max_grants: usize,
+    max_entries: usize,
+    max_depth: usize,
+    traversal_depth: Option<usize>,
 ) -> Result<Vec<LedgerRoot>, String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -569,17 +604,102 @@ pub(crate) fn partition_non_following_read_root_with_limits(
             ));
         }
     }
-    let mut scan_budget = NonFollowingScanBudget::new(max_entries);
+    if let Some(traversal_depth) = traversal_depth {
+        let mut scan_budget = NonFollowingDirectoryBudget::new(max_entries);
+        let roots = plan_bounded_non_following_directories(
+            path,
+            max_grants,
+            &mut scan_budget,
+            0,
+            max_depth,
+            traversal_depth,
+        )?;
+        ensure_non_following_grant_limit(roots.len(), max_grants)?;
+        return Ok(roots);
+    }
+    let mut scan_budget = NonFollowingDirectoryBudget::new(max_entries);
     let roots =
         plan_non_following_directory(path, max_grants, &mut scan_budget, 0, max_depth)?.roots;
     ensure_non_following_grant_limit(roots.len(), max_grants)?;
     Ok(roots)
 }
 
+fn plan_bounded_non_following_directories(
+    path: &Path,
+    max_grants: usize,
+    scan_budget: &mut NonFollowingDirectoryBudget,
+    depth: usize,
+    max_depth: usize,
+    remaining_depth: usize,
+) -> Result<Vec<LedgerRoot>, String> {
+    if depth > max_depth {
+        return Err(format!(
+            "nonFollowingReadRoot exceeds the safe nested-directory limit of {max_depth} below the root"
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect ACL root {} failed: {error}", path.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(Vec::new());
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "expected a directory while partitioning ACL root: {}",
+            path.display()
+        ));
+    }
+
+    let mut roots = vec![read_root(path, false)?];
+    ensure_non_following_grant_limit(roots.len(), max_grants)?;
+    if remaining_depth == 0 {
+        return Ok(roots);
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("scan ACL root {} failed: {error}", path.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("scan ACL root {} failed: {error}", path.display()))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "inspect ACL root {} failed: {error}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let child = entry.path();
+        let child_metadata = fs::symlink_metadata(&child)
+            .map_err(|error| format!("inspect ACL root {} failed: {error}", child.display()))?;
+        if child_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            scan_budget.consume()?;
+            continue;
+        }
+        if child_metadata.is_dir() {
+            scan_budget.consume()?;
+            let child_roots = plan_bounded_non_following_directories(
+                &child,
+                max_grants,
+                scan_budget,
+                depth.saturating_add(1),
+                max_depth,
+                remaining_depth.saturating_sub(1),
+            )?;
+            append_partitioned_roots(&mut roots, child_roots, max_grants)?;
+        }
+    }
+    Ok(roots)
+}
+
 fn plan_non_following_directory(
     path: &Path,
     max_grants: usize,
-    scan_budget: &mut NonFollowingScanBudget,
+    scan_budget: &mut NonFollowingDirectoryBudget,
     depth: usize,
     max_depth: usize,
 ) -> Result<DirectoryReadPlan, String> {
@@ -607,7 +727,6 @@ fn plan_non_following_directory(
     for entry in fs::read_dir(path)
         .map_err(|error| format!("scan ACL root {} failed: {error}", path.display()))?
     {
-        scan_budget.consume()?;
         entries.push(
             entry.map_err(|error| format!("scan ACL root {} failed: {error}", path.display()))?,
         );
@@ -621,6 +740,7 @@ fn plan_non_following_directory(
         let child_metadata = fs::symlink_metadata(&child)
             .map_err(|error| format!("inspect ACL root {} failed: {error}", child.display()))?;
         if child_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            scan_budget.consume()?;
             clean = false;
             let child_grants = directory_plans
                 .iter()
@@ -629,6 +749,7 @@ fn plan_non_following_directory(
             continue;
         }
         if child_metadata.is_dir() {
+            scan_budget.consume()?;
             let child_plan = plan_non_following_directory(
                 &child,
                 max_grants,
@@ -740,6 +861,56 @@ fn reject_aliased_entries(path: &Path) -> Result<fs::Metadata, String> {
 /// grant mutates belongs to the file object shared by every hard link, so a
 /// path-keyed admission that only sees one alias must not grant through it.
 fn reject_multi_link_file(path: &Path) -> Result<(), String> {
+    let information = path_entry_information(path)?;
+    if information.nNumberOfLinks > 1 {
+        return Err(format!(
+            "ACL root contains a multi-link file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_following_read_root_source(
+    source: &Path,
+    enforcement: &Path,
+) -> Result<(), String> {
+    let source_information = path_entry_information(source)?;
+    if source_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!(
+            "nonFollowingReadRootSource contains a reparse point: {}",
+            source.display()
+        ));
+    }
+    if source_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(format!(
+            "nonFollowingReadRootSource must be a directory: {}",
+            source.display()
+        ));
+    }
+
+    let enforcement_information = path_entry_information(enforcement)?;
+    if enforcement_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || enforcement_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(format!(
+            "nonFollowingReadRoot must be an ordinary directory: {}",
+            enforcement.display()
+        ));
+    }
+    if source_information.dwVolumeSerialNumber != enforcement_information.dwVolumeSerialNumber
+        || source_information.nFileIndexHigh != enforcement_information.nFileIndexHigh
+        || source_information.nFileIndexLow != enforcement_information.nFileIndexLow
+    {
+        return Err(format!(
+            "nonFollowingReadRootSource does not identify nonFollowingReadRoot: {}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+fn path_entry_information(path: &Path) -> Result<BY_HANDLE_FILE_INFORMATION, String> {
     let wide_path = wide(&path.to_string_lossy());
     let handle = unsafe {
         CreateFileW(
@@ -767,13 +938,7 @@ fn reject_multi_link_file(path: &Path) -> Result<(), String> {
             path.display()
         )));
     }
-    if information.nNumberOfLinks > 1 {
-        return Err(format!(
-            "ACL root contains a multi-link file: {}",
-            path.display()
-        ));
-    }
-    Ok(())
+    Ok(information)
 }
 
 pub(crate) fn write_ledger(path: &Path, ledger: &Ledger) -> Result<(), String> {

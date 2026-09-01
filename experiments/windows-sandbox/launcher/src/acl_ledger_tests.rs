@@ -29,7 +29,8 @@ mod tests {
     use crate::acl_ledger::{
         LEDGER_VERSION, LaunchFailure, Ledger, LedgerRoot, collect_roots,
         partition_non_following_read_root_with_limit,
-        partition_non_following_read_root_with_limits, recover_stale, with_acl_grants,
+        partition_non_following_read_root_with_limits,
+        partition_non_following_read_root_with_options, recover_stale, with_acl_grants,
         write_ledger,
     };
     use crate::protocol::{LaunchRequest, NetworkMode};
@@ -341,6 +342,8 @@ mod tests {
             environment: BTreeMap::new(),
             timeout_ms: None,
             non_following_read_root: None,
+            non_following_read_root_source: None,
+            non_following_read_root_max_depth: None,
         }
     }
 
@@ -424,6 +427,7 @@ mod tests {
         let root = fixture.target_str();
         let mut request = launch_request(vec![root.clone()], Vec::new(), Vec::new(), Vec::new());
         request.non_following_read_root = Some(root.clone());
+        request.non_following_read_root_source = Some(root.clone());
 
         let roots = collect_roots(&request).expect("clean tree admits");
 
@@ -453,6 +457,7 @@ mod tests {
         );
         let mut request = raw_request;
         request.non_following_read_root = Some(target.clone());
+        request.non_following_read_root_source = Some(target.clone());
 
         let roots = collect_roots(&request).expect("partition non-following read root");
 
@@ -487,9 +492,11 @@ mod tests {
         let base = fixture.target.parent().expect("fixture base");
         let junction = base.join("root-junction");
         create_junction(&junction, &fixture.target);
-        let root = junction.to_string_lossy().into_owned();
+        let root = fixture.target_str();
+        let source = junction.to_string_lossy().into_owned();
         let mut request = launch_request(vec![root.clone()], Vec::new(), Vec::new(), Vec::new());
         request.non_following_read_root = Some(root);
+        request.non_following_read_root_source = Some(source);
 
         let error = collect_roots(&request).expect_err("reparse root must fail closed");
 
@@ -509,7 +516,8 @@ mod tests {
             .expect("create hard link into tree");
         let root = fixture.target_str();
         let mut request = launch_request(vec![root.clone()], Vec::new(), Vec::new(), Vec::new());
-        request.non_following_read_root = Some(root);
+        request.non_following_read_root = Some(root.clone());
+        request.non_following_read_root_source = Some(root);
 
         let error = collect_roots(&request).expect_err("multi-link file must fail closed");
 
@@ -540,17 +548,51 @@ mod tests {
     fn non_following_read_root_bounds_scan_work_before_planning_finishes() {
         let fixture = Fixture::new("non-following-scan-limit");
 
-        let roots = partition_non_following_read_root_with_limits(&fixture.target, 4_096, 2, 256)
-            .expect("an exact scan-entry budget must admit the clean fixture");
+        let roots = partition_non_following_read_root_with_limits(&fixture.target, 4_096, 1, 256)
+            .expect("an exact directory budget must admit the clean fixture");
         assert_eq!(roots.len(), 1);
 
-        let error = partition_non_following_read_root_with_limits(&fixture.target, 4_096, 1, 256)
-            .expect_err("filesystem scan work must be bounded independently of final grants");
+        let error = partition_non_following_read_root_with_limits(&fixture.target, 4_096, 0, 256)
+            .expect_err("directory scan work must be bounded independently of final grants");
 
         assert!(
-            error.contains("safe scan limit of 1 filesystem entries"),
+            error.contains("safe directory scan limit of 0 entries"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn ordinary_files_do_not_exhaust_the_directory_scan_budget() {
+        let fixture = Fixture::new("non-following-large-file-tree");
+        fs::remove_dir_all(fixture.target.join("child")).expect("remove fixture directory");
+        for name in ["main.go", "peer-a.txt", "peer-b.txt"] {
+            fs::write(fixture.target.join(name), name).expect("seed ordinary file");
+        }
+
+        // A zero directory budget admits any number of ordinary single-link
+        // files. This is the regression for roots with >100k file entries:
+        // file count no longer decides whether admission is available.
+        let roots = partition_non_following_read_root_with_limits(&fixture.target, 4_096, 0, 256)
+            .expect("ordinary files must not consume the directory budget");
+
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].read_recursive);
+    }
+
+    #[test]
+    fn root_only_glob_skips_entry_scan_for_arbitrarily_large_trees() {
+        let fixture = Fixture::new("non-following-root-only");
+
+        // A zero scan budget proves that admission does not enumerate even
+        // the fixture's existing children. The same constant work therefore
+        // applies when a root-only pattern such as `main.go` has >100k peers.
+        let roots =
+            partition_non_following_read_root_with_options(&fixture.target, 4_096, 0, 256, Some(0))
+                .expect("root-only Glob must not scan child entries");
+
+        assert_eq!(roots.len(), 1);
+        assert!(!roots[0].read_recursive);
+        assert!(roots[0].path.eq_ignore_ascii_case(&fixture.target_str()));
     }
 
     #[test]

@@ -57,10 +57,16 @@ export interface SandboxPathContext {
   unavailableProfilePaths?: readonly string[];
   /**
    * Windows-only recursive read root whose operation contract does not
-   * follow reparse points. The broker may split this root into narrower
-   * physical ACL grants while omitting nested reparse entries.
+   * follow reparse points. `enforcementPath` remains the canonical authority,
+   * while `sourcePath` preserves the final path entry before realpath so the
+   * broker can reject a root junction before granting ACLs.
    */
-  windowsNonFollowingReadRoot?: string;
+  windowsNonFollowingReadRoot?: {
+    readonly enforcementPath: string;
+    readonly sourcePath: string;
+    /** Omitted when a GLOBSTAR makes traversal depth unbounded. */
+    readonly maxDepth?: number;
+  };
   /** Profile roots pinned by open host descriptors until sandbox launch. */
   pinnedProfilePaths?: readonly {
     path: string;

@@ -130,11 +130,17 @@ test('admits one recursive read root for non-following broker decomposition', ()
     },
   };
   const input = command(recursiveRead);
-  input.pathContext.windowsNonFollowingReadRoot = String.raw`C:\work\repo`;
+  input.pathContext.windowsNonFollowingReadRoot = {
+    enforcementPath: String.raw`C:\work\repo`,
+    sourcePath: String.raw`C:\work\repo`,
+  };
 
   const policy = compileWindowsSandboxPolicy(input);
 
-  assert.equal(policy.nonFollowingReadRoot, String.raw`C:\work\repo`);
+  assert.deepEqual(policy.nonFollowingReadRoot, {
+    enforcementPath: String.raw`C:\work\repo`,
+    sourcePath: String.raw`C:\work\repo`,
+  });
 });
 
 test('rejects invalid non-following read-root combinations', () => {
@@ -146,7 +152,10 @@ test('rejects invalid non-following read-root combinations', () => {
     },
   };
   const outside = command(recursiveRead);
-  outside.pathContext.windowsNonFollowingReadRoot = String.raw`C:\outside`;
+  outside.pathContext.windowsNonFollowingReadRoot = {
+    enforcementPath: String.raw`C:\outside`,
+    sourcePath: String.raw`C:\outside`,
+  };
   assert.throws(() => compileWindowsSandboxPolicy(outside), /not a declared read root/);
 
   const exact: PermissionProfileManaged = {
@@ -157,11 +166,17 @@ test('rejects invalid non-following read-root combinations', () => {
     },
   };
   const exactInput = command(exact);
-  exactInput.pathContext.windowsNonFollowingReadRoot = String.raw`C:\work\repo`;
+  exactInput.pathContext.windowsNonFollowingReadRoot = {
+    enforcementPath: String.raw`C:\work\repo`,
+    sourcePath: String.raw`C:\work\repo`,
+  };
   assert.throws(() => compileWindowsSandboxPolicy(exactInput), /must be recursive/);
 
   const writable = command(createWorkspaceWritePermissionProfile());
-  writable.pathContext.windowsNonFollowingReadRoot = String.raw`C:\work\repo`;
+  writable.pathContext.windowsNonFollowingReadRoot = {
+    enforcementPath: String.raw`C:\work\repo`,
+    sourcePath: String.raw`C:\work\repo`,
+  };
   assert.throws(() => compileWindowsSandboxPolicy(writable), /read-only sandbox profile/);
 });
 

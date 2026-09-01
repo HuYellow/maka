@@ -31,7 +31,11 @@ export interface WindowsSandboxPolicy {
   readonly exactWriteRoots: readonly string[];
   readonly network: 'restricted' | 'enabled';
   readonly environment: Readonly<Record<string, string>>;
-  readonly nonFollowingReadRoot?: string;
+  readonly nonFollowingReadRoot?: {
+    readonly enforcementPath: string;
+    readonly sourcePath: string;
+    readonly maxDepth?: number;
+  };
 }
 
 export function compileWindowsSandboxPolicy(command: SandboxCommand): WindowsSandboxPolicy {
@@ -99,20 +103,28 @@ export function compileWindowsSandboxPolicy(command: SandboxCommand): WindowsSan
   }
 
   const nonFollowingReadRoot = pathContext.windowsNonFollowingReadRoot
-    ? canonicalWindowsPath(pathContext.windowsNonFollowingReadRoot)
+    ? {
+        enforcementPath: canonicalWindowsPath(
+          pathContext.windowsNonFollowingReadRoot.enforcementPath,
+        ),
+        sourcePath: canonicalWindowsPath(pathContext.windowsNonFollowingReadRoot.sourcePath),
+        ...(pathContext.windowsNonFollowingReadRoot.maxDepth !== undefined
+          ? { maxDepth: pathContext.windowsNonFollowingReadRoot.maxDepth }
+          : {}),
+      }
     : undefined;
   if (nonFollowingReadRoot && writeRoots.length > 0) {
     throw new Error('Windows non-following read roots require a read-only sandbox profile.');
   }
   if (nonFollowingReadRoot) {
-    if (!containsPath(readRoots, nonFollowingReadRoot)) {
+    if (!containsPath(readRoots, nonFollowingReadRoot.enforcementPath)) {
       throw new Error(
-        `Windows non-following root is not a declared read root: ${nonFollowingReadRoot}`,
+        `Windows non-following root is not a declared read root: ${nonFollowingReadRoot.enforcementPath}`,
       );
     }
-    if (containsPath(exactReadRoots, nonFollowingReadRoot)) {
+    if (containsPath(exactReadRoots, nonFollowingReadRoot.enforcementPath)) {
       throw new Error(
-        `Windows non-following root must be recursive, not exact: ${nonFollowingReadRoot}`,
+        `Windows non-following root must be recursive, not exact: ${nonFollowingReadRoot.enforcementPath}`,
       );
     }
   }

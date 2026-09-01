@@ -85,8 +85,13 @@ default, and grants that per-launch SID only the requested roots. The W1
 filesystem worker can explicitly mark one read-only Glob root for non-following
 decomposition: nested reparse entries are omitted while clean child directories
 receive narrower recursive grants; the root itself and hard links remain
-fail-closed. Planning is bounded to 4,096 physical grants, 100,000 inspected
-filesystem entries, and 256 nested directory levels below the root. A short-lived global mutex
+fail-closed. The manifest binds both the canonical authority and the original
+unfollowed root entry; the broker opens both without following and requires the
+same directory identity. Finite Glob patterns also bind their maximum traversal
+depth, so a root-only pattern receives one exact directory grant without scanning
+its children. Planning is bounded to 4,096 physical grants, 100,000 directory or
+reparse entries, and 256 nested directory levels below the root; ordinary file
+count does not exhaust the planning budget. A short-lived global mutex
 serializes ACL mutation, while a request-specific kernel lease distinguishes
 live ledgers from abandoned ones without serializing child execution. The smoke
 proves allowed read/write access, denial of a user-readable sibling file and

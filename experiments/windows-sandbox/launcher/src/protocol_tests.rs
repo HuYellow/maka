@@ -90,6 +90,8 @@ mod tests {
         let value = request();
         assert!(value.launch.timeout_ms.is_none());
         assert!(value.launch.non_following_read_root.is_none());
+        assert!(value.launch.non_following_read_root_source.is_none());
+        assert!(value.launch.non_following_read_root_max_depth.is_none());
         let serialized = serde_json::to_string(&value.launch).expect("serialize launch");
         assert!(!serialized.contains("timeoutMs"));
         assert!(!serialized.contains("nonFollowingReadRoot"));
@@ -107,6 +109,8 @@ mod tests {
         let mut value = request();
         value.launch.read_roots = vec![root.clone()];
         value.launch.non_following_read_root = Some(root.clone());
+        value.launch.non_following_read_root_source = Some(root.clone());
+        value.launch.non_following_read_root_max_depth = Some(0);
         assert!(value.launch.validate().is_ok());
 
         let mut missing = value.launch.clone();
@@ -129,6 +133,34 @@ mod tests {
             writable.validate().unwrap_err(),
             "nonFollowingReadRoot requires a read-only launch"
         );
+
+        let mut missing_source = value.launch.clone();
+        missing_source.non_following_read_root_source = None;
+        assert_eq!(
+            missing_source.validate().unwrap_err(),
+            "nonFollowingReadRoot requires nonFollowingReadRootSource"
+        );
+
+        let mut source_only = request().launch;
+        source_only.non_following_read_root_source = Some(root.clone());
+        assert_eq!(
+            source_only.validate().unwrap_err(),
+            "nonFollowingReadRootSource requires nonFollowingReadRoot"
+        );
+
+        let mut depth_only = request().launch;
+        depth_only.non_following_read_root_max_depth = Some(0);
+        assert_eq!(
+            depth_only.validate().unwrap_err(),
+            "nonFollowingReadRootMaxDepth requires nonFollowingReadRoot"
+        );
+
+        let mut excessive_depth = value.launch.clone();
+        excessive_depth.non_following_read_root_max_depth = Some(257);
+        assert_eq!(
+            excessive_depth.validate().unwrap_err(),
+            "nonFollowingReadRootMaxDepth must not exceed 256"
+        );
     }
 
     #[test]
@@ -137,6 +169,8 @@ mod tests {
         value.launch.read_roots = vec!["C:\\work\\repo".to_owned()];
         let original = launch_digest(&value.launch).expect("original digest");
         value.launch.non_following_read_root = Some("C:\\work\\repo".to_owned());
+        value.launch.non_following_read_root_source = Some("C:\\work\\repo".to_owned());
+        value.launch.non_following_read_root_max_depth = Some(0);
 
         assert_ne!(
             launch_digest(&value.launch).expect("marked digest"),

@@ -57,6 +57,7 @@ import {
   type FilesystemWorkerRequest,
   type FilesystemWorkerResult,
 } from '../filesystem-worker/protocol.js';
+import { windowsGlobTraversalDepth } from '../filesystem-worker/windows-glob-pattern.js';
 import { LinuxBubblewrapBackend } from '../sandbox/linux-sandbox.js';
 import { MacosSeatbeltBackend } from '../sandbox/macos-seatbelt.js';
 import { SandboxManager } from '../sandbox/sandbox-manager.js';
@@ -75,6 +76,16 @@ afterEach(async () => {
 test('Read image payloads fit within the filesystem worker response limit', () => {
   const base64Bytes = 4 * Math.ceil(MAX_READ_IMAGE_BYTES / 3);
   assert.ok(base64Bytes + 1024 < FILESYSTEM_WORKER_MAX_RESPONSE_BYTES);
+});
+
+test('derives a conservative finite Windows Glob traversal depth', () => {
+  assert.equal(windowsGlobTraversalDepth('main.go'), 0);
+  assert.equal(windowsGlobTraversalDepth('*'), 0);
+  assert.equal(windowsGlobTraversalDepth('src/*.ts'), 1);
+  assert.equal(windowsGlobTraversalDepth('./src/main.ts'), 1);
+  assert.equal(windowsGlobTraversalDepth('packages/*/main.ts'), 2);
+  assert.equal(windowsGlobTraversalDepth('{src,docs}/*.md'), 1);
+  assert.equal(windowsGlobTraversalDepth('src/**/*.ts'), undefined);
 });
 
 describe('filesystem worker client permission snapshots', () => {
@@ -499,7 +510,50 @@ describe('filesystem worker Windows Glob path context', () => {
       expectedIdentity: 'unchecked',
     });
 
-    assert.equal(transforms[0]?.command.pathContext.windowsNonFollowingReadRoot, workspace);
+    assert.deepEqual(transforms[0]?.command.pathContext.windowsNonFollowingReadRoot, {
+      enforcementPath: workspace,
+      sourcePath: workspace,
+    });
+  });
+
+  test('preserves the un-followed Glob root beside its canonical authority', async () => {
+    const workspace = await temporaryDirectory('maka-windows-worker-glob-root-link-');
+    const target = join(workspace, 'target');
+    const rootLink = join(workspace, 'root-link');
+    await mkdir(target);
+    await symlink(target, rootLink, process.platform === 'win32' ? 'junction' : 'dir');
+    const { client, transforms, requests } = fakeClient({ platform: 'win32' });
+
+    await client.execute({
+      operation: { kind: 'glob', path: rootLink, pattern: '**/*.ts' },
+      cwd: workspace,
+      mode: 'ask',
+      expectedIdentity: 'unchecked',
+    });
+
+    assert.equal(requests[0]?.operation.path, target);
+    assert.deepEqual(transforms[0]?.command.pathContext.windowsNonFollowingReadRoot, {
+      enforcementPath: target,
+      sourcePath: rootLink,
+    });
+  });
+
+  test('bounds broker planning for a root-only Glob pattern', async () => {
+    const workspace = await temporaryDirectory('maka-windows-worker-glob-bounded-');
+    const { client, transforms } = fakeClient({ platform: 'win32' });
+
+    await client.execute({
+      operation: { kind: 'glob', path: workspace, pattern: 'main.go', limit: 1 },
+      cwd: workspace,
+      mode: 'ask',
+      expectedIdentity: 'unchecked',
+    });
+
+    assert.deepEqual(transforms[0]?.command.pathContext.windowsNonFollowingReadRoot, {
+      enforcementPath: workspace,
+      sourcePath: workspace,
+      maxDepth: 0,
+    });
   });
 
   test('does not mark other operations or a non-Windows Glob', async () => {

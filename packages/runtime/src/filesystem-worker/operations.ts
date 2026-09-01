@@ -18,10 +18,10 @@
  */
 
 import { spawn } from 'node:child_process';
-import { promises as fs, type Dirent } from 'node:fs';
+import { promises as fs, type BigIntStats, type Dirent } from 'node:fs';
 import { glob as nodeGlob } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
-import { GLOBSTAR, Minimatch, type MinimatchOptions } from 'minimatch';
+import { GLOBSTAR } from 'minimatch';
 import { isPathInside } from '../path-containment.js';
 import { sandboxPathApi } from './sandbox-paths.js';
 import { sandboxBoundaryExpansionAllowsPath } from '@maka/core/sandbox-boundary';
@@ -54,6 +54,7 @@ import {
   type FilesystemWorkerTarget,
 } from './protocol.js';
 import { isLikelySandboxDenial } from '../sandbox/detect.js';
+import { compileWindowsGlobPattern, type WindowsGlobPatternPart } from './windows-glob-pattern.js';
 
 // Canonicalisation must match the sandbox the worker runs in: realpath-based
 // on POSIX, lexical + reparse-rejecting inside the Windows AppContainer where
@@ -61,15 +62,6 @@ import { isLikelySandboxDenial } from '../sandbox/detect.js';
 const { realpath, realpathAllowMissing, resolveCanonicalDirectoryEntryTarget } = sandboxPathApi();
 
 const DEFAULT_GLOB_LIMIT = 200;
-const WINDOWS_GLOB_MATCH_OPTIONS = {
-  nocase: true,
-  windowsPathsNoEscape: true,
-  nonegate: true,
-  nocomment: true,
-  optimizationLevel: 2,
-  platform: 'win32',
-  nocaseMagicOnly: true,
-} satisfies MinimatchOptions;
 const MAX_GREP_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_GREP_STDERR_BYTES = 16 * 1024;
 
@@ -675,8 +667,6 @@ function assertContainedGlobPattern(pattern: string): void {
   }
 }
 
-type WindowsGlobPatternPart = string | RegExp | typeof GLOBSTAR;
-
 interface WindowsGlobBranchState {
   readonly id: number;
   readonly pattern: readonly WindowsGlobPatternPart[];
@@ -696,10 +686,9 @@ async function windowsNonFollowingGlob(
   limit: number,
   readDirectory?: (path: string) => Promise<Dirent[]>,
 ): Promise<string[]> {
-  const matcher = new Minimatch(pattern, WINDOWS_GLOB_MATCH_OPTIONS);
-  const initialBranches = matcher.set.map((compiled, id) => ({
+  const initialBranches = compileWindowsGlobPattern(pattern).map((compiled, id) => ({
     id,
-    pattern: compiled as WindowsGlobPatternPart[],
+    pattern: compiled,
     indexes: [0],
   }));
   const files: string[] = [];
@@ -911,12 +900,51 @@ async function readWindowsNonFollowingDirectory(
   path: string,
   readDirectory?: (path: string) => Promise<Dirent[]>,
 ): Promise<Dirent[] | undefined> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
   try {
-    return await (readDirectory ? readDirectory(path) : fs.readdir(path, { withFileTypes: true }));
+    const beforeOpen = await fs.lstat(path, { bigint: true });
+    if (!isOrdinaryDirectory(beforeOpen)) return changedWindowsGlobDirectory(root, path);
+
+    // A parent Dirent is only a hint. Keep a directory handle open while the
+    // path is read and compare its identity before and after readdir so a
+    // directory-to-junction replacement cannot contribute target entries.
+    handle = await fs.open(path, 'r');
+    const opened = await handle.stat({ bigint: true });
+    if (!sameDirectoryIdentity(beforeOpen, opened)) {
+      return changedWindowsGlobDirectory(root, path);
+    }
+    const beforeRead = await fs.lstat(path, { bigint: true });
+    if (!isOrdinaryDirectory(beforeRead) || !sameDirectoryIdentity(opened, beforeRead)) {
+      return changedWindowsGlobDirectory(root, path);
+    }
+
+    const entries = await (readDirectory
+      ? readDirectory(path)
+      : fs.readdir(path, { withFileTypes: true }));
+    const afterRead = await fs.lstat(path, { bigint: true });
+    if (!isOrdinaryDirectory(afterRead) || !sameDirectoryIdentity(opened, afterRead)) {
+      return changedWindowsGlobDirectory(root, path);
+    }
+    return entries;
   } catch (error) {
     if (path !== root && isNonFollowingPrunableError(error)) return undefined;
     throw error;
+  } finally {
+    await handle?.close();
   }
+}
+
+function isOrdinaryDirectory(metadata: BigIntStats): boolean {
+  return metadata.isDirectory() && !metadata.isSymbolicLink();
+}
+
+function sameDirectoryIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function changedWindowsGlobDirectory(root: string, path: string): undefined {
+  if (path !== root) return undefined;
+  throw operationError('path_changed', 'Windows Glob root changed during directory traversal.');
 }
 
 function isNonFollowingPrunableError(error: unknown): boolean {

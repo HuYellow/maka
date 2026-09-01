@@ -394,9 +394,16 @@ for the current launch. Before mutation it recursively rejects `FILE_ATTRIBUTE_R
 default. A manifest produced specifically for the read-only W1 Glob operation may mark its single
 recursive root as non-following: the broker then records an exact grant for directories containing a
 nested reparse entry, recursive grants for clean child directories, and no grant for the reparse
-entry or its target. The marked root itself and every multi-hard-link file still fail closed. The
-decomposition fails closed above 4,096 physical grants, 100,000 inspected filesystem entries, or 256
-nested directory levels below the root. The broker persists a versioned ledger with `create_new` and `sync_all`, and
+entry or its target. The manifest binds both the canonical authority and the original final path
+entry; before ACL mutation the broker opens both with `FILE_FLAG_OPEN_REPARSE_POINT`, rejects a root
+reparse point, and requires matching volume/file identity. The worker also compares an opened
+directory handle with non-following path metadata before and after each `readdir`, pruning a child
+whose cached `Dirent` was replaced. A finite Glob pattern binds its maximum traversal depth, so a
+root-only pattern receives one exact directory grant without scanning its children; GLOBSTAR keeps
+the full decomposition. The marked root itself and every multi-hard-link file included in a
+recursive grant still fail closed. Decomposition fails closed above 4,096 physical grants, 100,000
+directory/reparse planning entries, or 256 nested directory levels below the root. Ordinary file
+count does not consume the directory planning budget. The broker persists a versioned ledger with `create_new` and `sync_all`, and
 reconciles every stale ledger before accepting a new request. A global kernel mutex covers only
 ledger/ACL mutation; each launch holds a separate
 request-specific kernel lease through child settlement, so recovery skips live ledgers while disjoint
@@ -497,7 +504,7 @@ For the W1 preview, the packaged verifier maps the supported attack surface to e
 
 | Category | Packaged evidence |
 | --- | --- |
-| Filesystem aliases | outside denial, raw recursive junction and multi-hard-link admission refusal, plus a product Glob that succeeds beside a nested junction without following it |
+| Filesystem aliases | outside denial; raw recursive junction and multi-hard-link refusal; root-junction refusal; cached-directory replacement pruning; a bounded root-only Glob; and a product Glob that succeeds beside a nested junction without following it |
 | Network channels | TCP connect denial without network capabilities |
 | IPC | host named-pipe denial and an explicit inherited-handle list |
 | Descendants | child creation is denied fail-closed, or a created descendant retains the AppContainer token and kill-on-close Job |

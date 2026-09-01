@@ -165,7 +165,11 @@ test('binds a non-following read root into the broker manifest digest', () => {
       },
       pathContext: {
         workspaceRoots: [String.raw`C:\work\repo`],
-        windowsNonFollowingReadRoot: String.raw`C:\work\repo`,
+        windowsNonFollowingReadRoot: {
+          enforcementPath: String.raw`C:\work\repo`,
+          sourcePath: String.raw`C:\work\repo`,
+          maxDepth: 0,
+        },
       },
     },
   });
@@ -173,6 +177,8 @@ test('binds a non-following read root into the broker manifest digest', () => {
   assert.equal(result.ok, true);
   const launch = written?.launch;
   assert.equal(launch?.nonFollowingReadRoot, String.raw`C:\work\repo`);
+  assert.equal(launch?.nonFollowingReadRootSource, String.raw`C:\work\repo`);
+  assert.equal(launch?.nonFollowingReadRootMaxDepth, 0);
   if (!written || !launch) return;
   assert.equal(
     written.profileDigest,

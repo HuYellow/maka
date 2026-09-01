@@ -259,6 +259,40 @@ describe('Windows filesystem worker smoke', { skip: !enabled }, () => {
       await readFile(join(outside, 'secret.ts'), 'utf8'),
       'export const secret = true;\n',
     );
+
+    // A root-only pattern carries maxDepth=0, so broker admission grants only
+    // the project directory and does not scan its children at all. Nested
+    // junctions and arbitrarily many unrelated entries cannot make it fail.
+    const rootOnly = await client.execute({
+      operation: { kind: 'glob', path: project, pattern: 'root.ts', limit: 1 },
+      cwd: workspace,
+      mode: 'ask',
+      expectedIdentity: 'unchecked',
+    });
+    assert.deepEqual(rootOnly, { kind: 'glob', files: ['root.ts'] });
+  });
+
+  test('rejects a requested Glob root that is itself a junction', async () => {
+    const target = join(workspace, 'root-junction-target');
+    const rootJunction = join(workspace, 'root-junction');
+    await mkdir(target);
+    await writeFile(join(target, 'secret.ts'), 'secret', 'utf8');
+    await symlink(target, rootJunction, 'junction');
+
+    await assert.rejects(
+      client.execute({
+        operation: { kind: 'glob', path: rootJunction, pattern: '**/*.ts' },
+        cwd: workspace,
+        mode: 'ask',
+        expectedIdentity: 'unchecked',
+      }),
+      (error: unknown) =>
+        error instanceof FilesystemWorkerClientError &&
+        error.reason === 'spawn_failed' &&
+        /nonFollowingReadRootSource.*reparse point/iu.test(error.message),
+    );
+
+    assert.equal(await readFile(join(target, 'secret.ts'), 'utf8'), 'secret');
   });
 
   test('fails closed for unapproved outside paths', async () => {
