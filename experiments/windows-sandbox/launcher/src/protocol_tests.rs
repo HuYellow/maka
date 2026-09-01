@@ -128,7 +128,7 @@ mod tests {
         );
 
         let mut writable = value.launch.clone();
-        writable.write_roots = vec![root];
+        writable.write_roots = vec![root.clone()];
         assert_eq!(
             writable.validate().unwrap_err(),
             "nonFollowingReadRoot requires a read-only launch"
