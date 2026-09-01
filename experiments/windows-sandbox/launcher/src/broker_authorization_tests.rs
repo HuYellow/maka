@@ -113,6 +113,8 @@ mod tests {
         value.profile_digest = launch_digest(&value.launch).expect("launch digest");
         let approved = value.profile_digest.clone();
         value.launch.non_following_read_root = Some("C:\\work".to_owned());
+        value.launch.non_following_read_root_source = Some("C:\\work".to_owned());
+        value.launch.non_following_read_root_max_depth = Some(0);
         let mut authorizer = BrokerAuthorizer::new([approved]);
 
         assert_eq!(
