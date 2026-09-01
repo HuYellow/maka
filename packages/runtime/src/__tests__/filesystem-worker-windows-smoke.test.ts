@@ -288,7 +288,8 @@ describe('Windows filesystem worker smoke', { skip: !enabled }, () => {
       }),
       (error: unknown) =>
         error instanceof FilesystemWorkerClientError &&
-        error.reason === 'spawn_failed' &&
+        error.stage === 'launch' &&
+        ['spawn_failed', 'worker_crashed'].includes(error.reason) &&
         /nonFollowingReadRootSource.*reparse point/iu.test(error.message),
     );
 

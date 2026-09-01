@@ -331,7 +331,8 @@ export async function verifyWindowsSandboxWorkerE2E(appDirectoryPath) {
     } catch (error) {
       rootJunctionDenied =
         error instanceof FilesystemWorkerClientError &&
-        error.reason === 'spawn_failed' &&
+        error.stage === 'launch' &&
+        ['spawn_failed', 'worker_crashed'].includes(error.reason) &&
         /nonFollowingReadRootSource.*reparse point/iu.test(error.message);
     }
     assertCondition(rootJunctionDenied, 'Sandboxed glob admitted a root junction.');
