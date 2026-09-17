@@ -40,6 +40,16 @@
 /* Maka product compositions shared across desktop renderer surfaces. Astryx
    owns generic component chrome; these selectors own only product semantics. */
 
+/* Default transcript notes can contain full diagnostics. Let Astryx's content
+   span shrink and wrap inside the reading measure; divider labels stay compact. */
+.maka-chat-system-message[data-variant='default'] > span {
+  min-width: 0;
+  max-width: 100%;
+  flex-shrink: 1;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* Retained tool evidence is not proof of current execution. Hide activity via
    Astryx's public spinner target without inventing a completed/failed tool. */
 .maka-tool-activity-card[data-activity-observed='false'] .astryx-spinner { display: none; }
