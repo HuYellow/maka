@@ -1,0 +1,42 @@
+[
+  {
+    "label": "fixed-zh-CN-1280",
+    "removedRules": 0,
+    "failure": null
+  },
+  {
+    "label": "fixed-zh-CN-720",
+    "removedRules": 0,
+    "failure": null
+  },
+  {
+    "label": "fixed-en-1280",
+    "removedRules": 0,
+    "failure": null
+  },
+  {
+    "label": "fixed-en-720",
+    "removedRules": 0,
+    "failure": null
+  },
+  {
+    "label": "baseline-zh-CN-1280",
+    "removedRules": 1,
+    "failure": "Error: [product-shell-official-appshell--long-system-notes (light/default/zh-CN/1280px)] console.error: AssertionError: expected 208.28125 to be greater than or equal to 367\n    at play (http://127.0.0.1:3421/assets/app-shell.stories-DmwD9vnI.js:70:1567)\n    at async bK.runPhase (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:607)\n    at async bK.render (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:3467)"
+  },
+  {
+    "label": "baseline-zh-CN-720",
+    "removedRules": 1,
+    "failure": "Error: [product-shell-official-appshell--long-system-notes (light/default/zh-CN/720px)] console.error: AssertionError: expected -71.71875 to be greater than or equal to 303.796875\n    at play (http://127.0.0.1:3421/assets/app-shell.stories-DmwD9vnI.js:70:1567)\n    at async bK.runPhase (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:607)\n    at async bK.render (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:3467)"
+  },
+  {
+    "label": "baseline-en-1280",
+    "removedRules": 1,
+    "failure": "Error: [product-shell-official-appshell--long-system-notes (light/default/en/1280px)] console.error: AssertionError: expected 4.109375 to be greater than or equal to 367\n    at play (http://127.0.0.1:3421/assets/app-shell.stories-DmwD9vnI.js:70:1567)\n    at async bK.runPhase (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:607)\n    at async bK.render (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:3467)"
+  },
+  {
+    "label": "baseline-en-720",
+    "removedRules": 1,
+    "failure": "Error: [product-shell-official-appshell--long-system-notes (light/default/en/720px)] console.error: AssertionError: expected -275.890625 to be greater than or equal to 303.796875\n    at play (http://127.0.0.1:3421/assets/app-shell.stories-DmwD9vnI.js:70:1567)\n    at async bK.runPhase (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:607)\n    at async bK.render (http://127.0.0.1:3421/assets/iframe-CNP5MOh8.js:915:3467)"
+  }
+]
