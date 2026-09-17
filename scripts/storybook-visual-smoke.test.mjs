@@ -58,6 +58,29 @@ test('dark theme sentinel stories render the default palette in both colour sche
   ]);
 });
 
+test('system-note regression covers both locales at standard and narrow widths', () => {
+  const storyId = 'product-shell-official-appshell--long-system-notes';
+  const jobs = catalogJobs(storyIndex(storyId));
+  assert.equal(jobs.length, 4);
+  assert.deepEqual(
+    jobs.map(({ locale, viewport }) => [locale, viewport.width, viewport.height]),
+    [
+      ['zh-CN', 1280, 900],
+      ['zh-CN', 720, 900],
+      ['en', 1280, 900],
+      ['en', 720, 900],
+    ],
+  );
+  for (const job of jobs) {
+    const url = new URL(storyUrl('http://localhost:6006', job));
+    assert.equal(url.searchParams.get('id'), storyId);
+    assert.equal(
+      url.searchParams.get('globals'),
+      `colorScheme:light;palette:default;locale:${job.locale}`,
+    );
+  }
+});
+
 test('forced-colors stories render under the forced palette', () => {
   const storyId = 'product-settings-pages--general-forced-colors-focus-ring';
 
