@@ -212,7 +212,7 @@ export function storyViewport(storyId) {
 
 export function jobLabel(job) {
   const forcedColors = job.forcedColors === 'active' ? '/forced-colors' : '';
-  const scenario = job.locale ? `/${job.locale}/${job.viewport.width}px` : '';
+  const scenario = `${job.locale ? `/${job.locale}` : ''}${job.viewport ? `/${job.viewport.width}px` : ''}`;
   return `${job.storyId} (${job.colorScheme}/${job.palette}${forcedColors}${scenario})`;
 }
 

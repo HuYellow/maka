@@ -19,9 +19,28 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { catalogJobs, isExpectedConsoleError, storyUrl } from './storybook-visual-smoke.mjs';
+import {
+  catalogJobs,
+  isExpectedConsoleError,
+  jobLabel,
+  storyUrl,
+} from './storybook-visual-smoke.mjs';
 
 const REFERENCE_STORY_ID = 'product-shell-official-appshell--native-conversation';
+
+test('job labels support independent locale and viewport overrides', () => {
+  const job = { storyId: 'example', colorScheme: 'light', palette: 'default' };
+  assert.equal(jobLabel(job), 'example (light/default)');
+  assert.equal(jobLabel({ ...job, locale: 'en' }), 'example (light/default/en)');
+  assert.equal(
+    jobLabel({ ...job, viewport: { width: 720, height: 900 } }),
+    'example (light/default/720px)',
+  );
+  assert.equal(
+    jobLabel({ ...job, locale: 'en', viewport: { width: 720, height: 900 } }),
+    'example (light/default/en/720px)',
+  );
+});
 const THEME_PALETTES = [
   'default',
   ...Array.from({ length: 10 }, (_, index) => `test-palette-${index + 1}`),
