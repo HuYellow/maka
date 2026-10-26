@@ -130,6 +130,10 @@ export function highlightMarkdownCode(
   language?: string,
   theme: TuiSyntaxHighlightTheme = defaultTheme,
 ): string[] {
+  // The Markdown hook is synchronous and reruns as a fence streams. Bound its
+  // input to 4,096 UTF-16 code units: grammars can take superlinear time on
+  // repetitive input. Larger blocks retain plain text on the input path.
+  if (code.length > 4 * 1024) return code.split('\n');
   const normalizedLanguage = normalizeLanguage(language);
   if (!normalizedLanguage) return code.split('\n');
 
