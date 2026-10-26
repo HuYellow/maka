@@ -1,0 +1,30 @@
+{
+  "generatedAt": "2026-10-26T07:54:20.830Z",
+  "node": "v24.22.1",
+  "width": 80,
+  "before": "Production shared Markdown theme with highlightCode temporarily undefined in this process",
+  "after": "Unmodified production highlightCode function and production capability-aware ANSI theme",
+  "surfaces": {
+    "live": "new MakaTranscriptComponent(...).render(80)",
+    "detailed": "new MakaTranscriptComponent(...).createDocumentRenderer()(80).lines"
+  },
+  "sourceUnchanged": true,
+  "strippedVisibleLinesIdentical": true,
+  "liveAndDetailedVisibleLinesIdentical": true,
+  "sourceSha256": "aaa827f4763216e7f38ace97b77aae3101d9ff379a253e1efa8cab8eec837430",
+  "repositorySourcesBefore": {
+    "packages/cli/src/tui-syntax-highlight.ts": "ab61cb7db4e14a067b1244cbf8c19fbfbd33b96a30a5f87814a70558c927a717",
+    "packages/cli/src/pi-transcript-format.ts": "767c8387719a878018c85be33697f9b625151f192623c5673bfa7c5bd124bd66",
+    "packages/cli/src/pi-tui-layout.ts": "674912b28830f688e0ef184b78942535dee4631bb3efb5713acc6f5408e0ebda"
+  },
+  "repositorySourcesAfter": {
+    "packages/cli/src/tui-syntax-highlight.ts": "ab61cb7db4e14a067b1244cbf8c19fbfbd33b96a30a5f87814a70558c927a717",
+    "packages/cli/src/pi-transcript-format.ts": "767c8387719a878018c85be33697f9b625151f192623c5673bfa7c5bd124bd66",
+    "packages/cli/src/pi-tui-layout.ts": "674912b28830f688e0ef184b78942535dee4631bb3efb5713acc6f5408e0ebda"
+  },
+  "rows": {
+    "live": 16,
+    "detailed": 16
+  },
+  "imageDisclosure": "Generated terminal render from captured ANSI output; not an actual shell screenshot."
+}
